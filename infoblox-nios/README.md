@@ -51,9 +51,9 @@ analyst can extend coverage.
 - `DHCPDISCOVER from <mac> via <relay-or-iface> TransID <hex>`
 - `Option 82: received a <kind> DHCP packet from relay-agent <ip> with a circuit-id of "<cid>", a remote-id of "<rid>" for <ip> (<mac>) lease time …`
 - DDNS forward / reverse map adds, removes, and failure variants
-- Lease-pool free-list housekeeping (`<ip>: removing client association (free) uid=<uid> hw=<mac>`)
+- Lease-pool free-list housekeeping (`<ip>: removing client association (free) [uid=<uid>] hw=<mac>` — uid token optional)
 - Truncated `DHCPEXPIRE on <ip> to` (relay-buffer cut; tagged `_truncated`)
-- A handful of dhcpd warnings (`label length`, `parse error`, `bad …`)
+- A handful of dhcpd warnings (`label length …`, `parse error …`, `bad …`, `fqdn …`)
 
 ### BIND shapes parsed
 

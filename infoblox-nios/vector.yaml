@@ -774,7 +774,8 @@ transforms:
       is_dhcpd_warning =
         starts_with(dhcpd_message, "label length") ||
         starts_with(dhcpd_message, "parse error") ||
-        starts_with(dhcpd_message, "bad ")
+        starts_with(dhcpd_message, "bad ") ||
+        starts_with(dhcpd_message, "fqdn ")
 
       if is_dhcpd_warning {
         action_token = "dhcpd-warning"
@@ -1230,13 +1231,17 @@ transforms:
         # byte), and the bare hardware address. Treat as a lease-end
         # event so SOC can correlate with subsequent re-leases.
         action_token = "dhcp-free"
+        # uid=<uid> token is optional — ISC dhcpd also emits a uid-less
+        # variant (`<ip>: removing client association (free) hw=<mac>`)
+        # when the original lease had no option-61 client-id. The
+        # hw=<mac> token is always present.
         free_assoc, parse_err = parse_regex(
           dhcpd_message,
-          r'^(?P<leased_ip>\d+\.\d+\.\d+\.\d+):\s+removing client association \(free\)\s+uid=(?P<uid>\S+)\s+hw=(?P<hw>[0-9a-fA-F:]+)$'
+          r'^(?P<leased_ip>\d+\.\d+\.\d+\.\d+):\s+removing client association \(free\)(?:\s+uid=(?P<uid>\S+))?\s+hw=(?P<hw>[0-9a-fA-F:]+)$'
         )
         if parse_err == null {
           leased_ip = string!(free_assoc.leased_ip)
-          client_uid = string!(free_assoc.uid)
+          if free_assoc.uid != null { client_uid = string!(free_assoc.uid) }
           client_mac_raw = string!(free_assoc.hw)
         }
       } else {
