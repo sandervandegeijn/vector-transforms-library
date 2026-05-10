@@ -841,20 +841,30 @@ transforms:
         # ── DHCPRELEASE of/from: Infoblox internal release path ──
         # Distinct from the long-form "DHCPRELEASE on <ip> to <mac>" above:
         # this shape uses "of <ip> from <mac>", carries an optional
-        # "(found)" lease-found marker between the interface and the
-        # trailing TransID, and never includes relay/lease-duration
-        # tokens. Treat as a normal release event.
+        # "(found)" or "(not found)" lease-state marker between the
+        # interface and the trailing TransID, and never includes
+        # relay/lease-duration tokens. Treat as a normal release event.
+        # The "via" token is either an interface name (eth2) or a relay
+        # IP — same dual role as DHCPREQUEST, so branch on whether it
+        # parses as an IPv4.
         action_token = "dhcp-release"
         dhcprelease_of, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPRELEASE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<iface>\S+)(?:\s+\((?P<found>found)\))?(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+          r'^DHCPRELEASE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+\((?P<found_state>(?:not\s+)?found)\))?(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
         )
         if parse_err == null {
           leased_ip = string!(dhcprelease_of.leased_ip)
           client_mac_raw = string!(dhcprelease_of.mac)
           if dhcprelease_of.hostname != null { client_hostname = string!(dhcprelease_of.hostname) }
-          iface = string!(dhcprelease_of.iface)
-          if dhcprelease_of.found != null { lease_found = true }
+          via_token = string!(dhcprelease_of.via)
+          if match(via_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = via_token
+          } else {
+            iface = via_token
+          }
+          if dhcprelease_of.found_state != null {
+            lease_found = string!(dhcprelease_of.found_state) == "found"
+          }
           if dhcprelease_of.transid != null { transaction_id = string!(dhcprelease_of.transid) }
           if dhcprelease_of.uid != null { client_uid = string!(dhcprelease_of.uid) }
         }
