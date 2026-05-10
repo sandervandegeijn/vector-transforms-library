@@ -1,0 +1,1560 @@
+data_dir: /var/lib/vector
+
+# ── Infoblox NIOS — Vector → ECS example pipeline ──
+# Maps the three Infoblox NIOS syslog channels to the Elastic Common
+# Schema:
+#   • dns-responses (BIND response channel: lines starting with
+#     "infoblox-responses:")
+#   • dns-queries   (BIND queries channel: lines starting with "queries:")
+#   • dhcp          (ISC dhcpd lease/DDNS/Option-82 events)
+# Anything that doesn't match a known shape is preserved as a tagged
+# pipeline_error rather than silently dropped (see "Error contract" in
+# README.md). A short list of operationally-pure noise lines is
+# explicitly authorized for silent drop — see README.md.
+#
+# GeoIP enrichment is intentionally omitted because, in the environment
+# this transform was developed against, every observed client IP was
+# RFC1918. README.md points to where to drop in a `geoip` enrichment
+# table when your traffic includes public IPs.
+
+sources:
+  syslog_in:
+    type: syslog
+    address: "0.0.0.0:514"
+    mode: udp
+
+transforms:
+  # ── adapt syslog-source output to Logstash-envelope shape ──
+  # Vector's syslog source emits flat fields (.appname, .procid, .hostname,
+  # .timestamp, .severity, .facility, .message). The per-partition VRL blocks
+  # were written for Logstash-shaped NDJSON where these are nested under
+  # .process.name, .process.pid, .host.hostname, .@timestamp, .log.syslog.*.
+  # This shim normalises the shape so the partition remaps work unchanged.
+  #
+  # Note: Vector's syslog source does not preserve the raw "<pri>..." line.
+  # event.original is set to .message (the post-envelope BIND/DHCP payload)
+  # with a comment so analysts know the PRI header is not recoverable without
+  # switching to bytes codec + parse_syslog in a downstream remap.
+  adapt_syslog:
+    type: remap
+    inputs:
+      - syslog_in
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── remap syslog envelope fields to Logstash-compatible paths ──
+      # appname → process.name (used by route_partitions discriminators)
+      # procid  → process.pid (string from syslog; coerce to int)
+      # hostname → host.hostname + host.ip (when hostname is an IP, as NIOS emits)
+      # timestamp → @timestamp (syslog source already provides a typed timestamp)
+      # severity / facility → log.syslog.severity.name / log.syslog.facility.name
+
+      .process.name = string!(.appname)
+      del(.appname)
+
+      # Vector's syslog source emits procid as int when numeric, string
+      # otherwise. to_int handles both — string!() would abort on int and
+      # drop the event (drop_on_abort: true silently swallows everything).
+      procid_int, procid_err = to_int(.procid)
+      if procid_err == null {
+        .process.pid = procid_int
+      }
+      del(.procid)
+
+      raw_hostname = string!(.hostname)
+      if raw_hostname != "" {
+        .host.hostname = raw_hostname
+        # NIOS appliances emit their management IP as the syslog hostname.
+        # Populate host.ip as a single-element array (ECS normalize: array).
+        if is_ipv4(raw_hostname) || is_ipv6(raw_hostname) {
+          .host.ip = [raw_hostname]
+        }
+      }
+      del(.hostname)
+
+      # .timestamp from the syslog source is already a typed timestamp;
+      # copy it to @timestamp. The syslog source also sets .timestamp on
+      # the event root — rename to avoid collision with Vector bookkeeping.
+      if .timestamp != null {
+        .@timestamp = .timestamp
+        del(.timestamp)
+      }
+
+      # Syslog source emits severity and facility as strings.
+      if .severity != null {
+        .log.syslog.severity.name = string!(.severity)
+        del(.severity)
+      }
+      if .facility != null {
+        .log.syslog.facility.name = string!(.facility)
+        del(.facility)
+      }
+
+      # ── event.original ──
+      # The syslog source has already consumed the raw "<pri>TIMESTAMP HOSTNAME
+      # APPNAME[PID]: MESSAGE" line; we cannot reconstruct the exact original
+      # frame. Set event.original to the payload message as the best available
+      # approximation. Document: the "<pri>" header is not recoverable via the
+      # typed syslog source; switch to bytes + parse_syslog remap if the full
+      # original line is required for compliance.
+      .event.original = string!(.message)
+
+      # ── drop network.forwarded_ip ──
+      # The upstream syslog parsing sometimes lands ISC dhcpd's "via <iface>"
+      # token (e.g. "eth2") in this field. OpenSearch maps it as type [ip], so
+      # any non-IP value fails the bulk request with mapper_parsing_exception
+      # — "Not retriable" → ~200-400 events lost per failure. Real relay IPs
+      # are extracted into the proper slot in remap_dhcp; this field is
+      # redundant. Drop it unconditionally.
+      del(.network.forwarded_ip)
+
+  # ── route by partition discriminators ──
+  # Conditions use .process.name (normalised above from .appname) and
+  # starts_with on .message (the BIND/DHCP payload string).
+  route_partitions:
+    type: route
+    inputs:
+      - adapt_syslog
+    route:
+      dns_responses: '.process.name == "named" && starts_with(string!(.message), "infoblox-responses:")'
+      dns_queries:   '.process.name == "named" && starts_with(string!(.message), "queries:")'
+      dhcp:          '.process.name == "dhcpd"'
+
+  # ── tag unrouted events so they're discoverable in OpenSearch ──
+  # `route_partitions._unmatched` collects anything that didn't match
+  # the named/dhcpd discriminators. Discarding silently makes future
+  # debugging hard ("we know we're missing events but can't see them").
+  # Instead, tag and publish to the dhcp Kafka topic (lower volume than
+  # DNS, easier to spot anomalies). Analysts query `tags:_unrouted` to
+  # see new process.names or payload prefixes the route doesn't cover.
+  tag_unrouted:
+    type: remap
+    inputs:
+      - "route_partitions._unmatched"
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── drop syslogd heartbeat noise (iter-8) ──
+      # Syslog daemons emit a periodic "-- MARK --" heartbeat with
+      # process.name="--" and message="MARK --". It carries no signal —
+      # pure liveness ping. Authorized for drop.
+      raw_message = string(.message) ?? ""
+      proc_name = string(.process.name) ?? ""
+      if proc_name == "--" || raw_message == "MARK --" || starts_with(raw_message, "-- MARK --") {
+        abort "noise:syslog-mark"
+      }
+
+      .event.kind = "pipeline_error"
+      .event.category = ["host"]
+      .event.type = ["info"]
+      .event.outcome = "unknown"
+      .tags = push(array(.tags) ?? [], "_unrouted")
+      .error = { "type": "no_route_match", "message": "no route_partitions discriminator matched" }
+      # Preserve the raw payload — without this, .message is the only
+      # diagnostic and downstream cleanup may strip it.
+      .event.original = raw_message
+
+  # ── dns-responses partition ──
+  remap_dns_responses:
+    type: remap
+    inputs:
+      - "route_partitions.dns_responses"
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── parse the BIND-named response payload ──
+      # Contract: upstream `adapt_syslog` has already extracted the syslog
+      # envelope into .process.name / .host.* / .@timestamp / .log.syslog.* /
+      # .event.original. .message is the plain BIND response payload.
+      #
+      # Format observed across samples:
+      #   "infoblox-responses: <ts> client <ip>#<port>: [view <N>: ]<UDP|TCP>:
+      #    query: <name> <class> <type> response: <rcode> <flags>[ <answers>]"
+      # The "view <N>:" segment is optional — older firmware and pseudo-zone
+      # probes (e.g. "version.bind CH TXT") omit the view clause entirely.
+      # The class token accepts any DNS class (IN/CH/HS/NONE/ANY) since
+      # Chaos-class probes are legitimate traffic, not malformed events.
+      # Iter-7 widening: BIND also renders RFC 3597 "unknown" classes as
+      # CLASS<N> (e.g. CLASS256 root-zone refused query) and unknown types
+      # as TYPE<N>. Allow digits inside the class token so the unknown
+      # encoding parses cleanly; the type slot is already \S+.
+      # The answer tail is optional — zero-RR responses ("NOERROR -AE" with
+      # no trailing records) are fine; dns.answers is left unset in that
+      # case. Default fallible — a regex miss tags _parse_failure instead
+      # of dropping (Gate 2 is strict on accounting). Strip trailing
+      # whitespace first — Vector's regex anchors $ at end-of-input, not
+      # before \n, and upstream may keep a trailing \n on .message.
+      bind_message = strip_whitespace(string!(.message))
+
+      # ── preflight: drop BIND FORMERR malformed-packet noise ──
+      # BIND emits "<unknown due to query error>" when the inbound question
+      # section is too malformed to parse qname/class/type. The FORMERR
+      # response code marks these as wire-protocol garbage with no DNS
+      # signal — no qname, class, or type ever decoded — so preserving
+      # them as tagged pipeline_errors adds noise without enabling pivots.
+      # Authorized for drop in docs/infoblox-authorized-drops.md.
+      # We match the conjunction (`<unknown due to query error>` AND
+      # `response: FORMERR`) so other rcodes that happen to carry the
+      # same unknown-question marker (SERVFAIL, REFUSED, …) still flow
+      # through the parser and end up tagged rather than silently dropped.
+      # drop_on_abort on this transform turns the abort into a clean drop;
+      # integration accounting treats the resulting gap as a documented
+      # drop, not a Gate-2 failure.
+      if contains(bind_message, "<unknown due to query error>") && contains(bind_message, "response: FORMERR") {
+        abort "noise:bind-formerr-malformed"
+      }
+
+      bind_payload, parse_err = parse_regex(
+        bind_message,
+        r'^infoblox-responses:\s+(?P<ts>\S+\s\S+)\s+client\s+(?P<client_ip>\S+)#(?P<client_port>\d+):\s+(?:view\s+(?P<view>\S+):\s+)?(?P<transport>\S+):\s+query:\s+(?P<qname>\S+)\s+(?P<qclass>[A-Z][A-Z0-9]+)\s+(?P<qtype>\S+)\s+response:\s+(?P<rcode>\S+)\s+(?P<flags>\S+)(?:\s+(?P<answers>.*))?$'
+      )
+
+      # ── unknown-question variant (iter-6) ──
+      # When BIND can decode the response code but the inbound question
+      # bytes were too garbled to extract qname/class/type, the payload
+      # carries the literal `<unknown due to query error>` token in place
+      # of the question tuple. FORMERR is dropped above; everything else
+      # (SERVFAIL, REFUSED, NOTIMP, NXDOMAIN…) reaches us here. We still
+      # have the response code, transport, client tuple, and flags glyph
+      # — emit those without dns.question.* so the event stays pivotable
+      # by client.ip / response_code without lying about the qname.
+      unknown_question = false
+      if parse_err != null {
+        bind_unknown, unknown_err = parse_regex(
+          bind_message,
+          r'^infoblox-responses:\s+(?P<ts>\S+\s\S+)\s+client\s+(?P<client_ip>\S+)#(?P<client_port>\d+):\s+(?:view\s+(?P<view>\S+):\s+)?(?P<transport>\S+):\s+query:\s+<unknown due to query error>\s+response:\s+(?P<rcode>\S+)\s+(?P<flags>\S+)$'
+        )
+        if unknown_err == null {
+          parse_err = null
+          unknown_question = true
+          bind_payload = bind_unknown
+        }
+      }
+
+      if parse_err != null {
+        # ── fallback: keep the event but mark it ──
+        .event.kind = "pipeline_error"
+        .event.category = ["host"]
+        .event.type = ["info", "error"]
+        .event.outcome = "failure"
+        .tags = push(array(.tags) ?? [], "_parse_failure")
+        .error = { "type": "parse_failure", "message": parse_err }
+      } else if unknown_question {
+        # ── unknown-question response (iter-6) ──
+        # Emit response_code, transport, client, flags; skip dns.question.*.
+        response_code      = string!(bind_payload.rcode)
+        raw_flags          = string!(bind_payload.flags)
+        client_ip_str      = string!(bind_payload.client_ip)
+        client_port_int    = to_int!(string!(bind_payload.client_port))
+        transport_str      = downcase(string!(bind_payload.transport))
+        bind_ts_str        = string!(bind_payload.ts)
+
+        .dns.response_code = response_code
+
+        decoded_flags = []
+        if contains(raw_flags, "A") { decoded_flags = push(decoded_flags, "AA") }
+        if contains(raw_flags, "t") { decoded_flags = push(decoded_flags, "TC") }
+        if contains(raw_flags, "C") { decoded_flags = push(decoded_flags, "CD") }
+        if contains(raw_flags, "D") { decoded_flags = push(decoded_flags, "DO") }
+        if contains(raw_flags, "+") {
+          decoded_flags = push(decoded_flags, "RA")
+        }
+        if length(decoded_flags) > 0 {
+          .dns.header_flags = decoded_flags
+        }
+
+        .network.protocol  = "dns"
+        .network.transport = transport_str
+        .client.ip   = client_ip_str
+        .client.port = client_port_int
+
+        host_ip_array = array(.host.ip) ?? []
+        if length(host_ip_array) > 0 {
+          .server.ip = string!(host_ip_array[0])
+        }
+
+        if bind_payload.view != null {
+          .infoblox_nios.log.view = string!(bind_payload.view)
+        }
+
+        # Mark the unknown-question shape so SOC can filter it explicitly.
+        .infoblox_nios.dns.unknown_question = true
+
+        related_ips = [client_ip_str]
+        if .server.ip != null {
+          related_ips = push(related_ips, string!(.server.ip))
+        }
+        .related.ip = related_ips
+
+        bind_ts, ts_err = parse_timestamp(
+          bind_ts_str,
+          format: "%d-%b-%Y %H:%M:%S%.3f"
+        )
+        if ts_err == null {
+          .@timestamp = bind_ts
+        }
+
+        .event.kind     = "event"
+        .event.category = ["network"]
+        .event.type     = ["info", "protocol"]
+        .event.action   = "dns-response"
+        .event.outcome  = if response_code == "NOERROR" {
+          "success"
+        } else {
+          "failure"
+        }
+      } else {
+        # All parse_regex captures are typed `string | undefined` — coerce
+        # to plain string up front so downstream ops are infallible.
+        question_name      = downcase(string!(bind_payload.qname))
+        question_class     = string!(bind_payload.qclass)
+        question_type      = string!(bind_payload.qtype)
+        response_code      = string!(bind_payload.rcode)
+        raw_flags          = string!(bind_payload.flags)
+        client_ip_str      = string!(bind_payload.client_ip)
+        client_port_int    = to_int!(string!(bind_payload.client_port))
+        transport_str      = downcase(string!(bind_payload.transport))
+        bind_ts_str        = string!(bind_payload.ts)
+
+        # ── DNS question + response code ──
+        # ECS recommends lowercase question names; BIND can mix case.
+        .dns.question.name  = question_name
+        .dns.question.class = question_class
+        .dns.question.type  = question_type
+        .dns.response_code  = response_code
+
+        # ── DNS header flags (decoded per Elastic pipeline_dns.yml) ──
+        # The single-token flags string ("+AE", "-AEDV", etc.) maps to ECS
+        # header_flags entries: A→AA, t→TC, C→CD, D→DO; and "+" decodes to
+        # RA when a response is present (always true here), else RD.
+        decoded_flags = []
+        if contains(raw_flags, "A") { decoded_flags = push(decoded_flags, "AA") }
+        if contains(raw_flags, "t") { decoded_flags = push(decoded_flags, "TC") }
+        if contains(raw_flags, "C") { decoded_flags = push(decoded_flags, "CD") }
+        if contains(raw_flags, "D") { decoded_flags = push(decoded_flags, "DO") }
+        if contains(raw_flags, "+") {
+          if response_code != "" {
+            decoded_flags = push(decoded_flags, "RA")
+          } else {
+            decoded_flags = push(decoded_flags, "RD")
+          }
+        }
+        if length(decoded_flags) > 0 {
+          .dns.header_flags = decoded_flags
+        }
+
+        # ── network identifiers ──
+        .network.protocol  = "dns"
+        .network.transport = transport_str
+
+        # ── client (DNS query originator) ──
+        # parse_regex captures are strings; ECS client.port is long.
+        .client.ip   = client_ip_str
+        .client.port = client_port_int
+
+        # ── server (the NIOS appliance receiving the query) ──
+        # The syslog envelope already carries this in host.ip; mirror it
+        # under server.ip per the Elastic oracle's role assignment.
+        host_ip_array = array(.host.ip) ?? []
+        if length(host_ip_array) > 0 {
+          .server.ip = string!(host_ip_array[0])
+        }
+
+        # ── view name (Infoblox-specific) ──
+        # Optional capture — older/pseudo-zone responses omit the view
+        # clause; only emit the field when BIND actually labelled one.
+        if bind_payload.view != null {
+          .infoblox_nios.log.view = string!(bind_payload.view)
+        }
+
+        # ── DNS answers ──
+        # The tail is "; "-separated RR records, each "name ttl class type data".
+        # The Elastic painless script splits on ';' and rebuilds a list of
+        # nested-object records; do the same in VRL. dns.answers is ECS
+        # object with normalize: array — list-of-objects is the correct
+        # shape per the rubric.
+        related_hosts = []
+        related_ips = []
+        if bind_payload.answers != null {
+          answers_tail = strip_whitespace(string!(bind_payload.answers))
+          # Strip trailing ';' so split doesn't yield an empty final record.
+          if ends_with(answers_tail, ";") {
+            answers_tail = slice!(answers_tail, 0, length(answers_tail) - 1)
+          }
+          rr_list = []
+          for_each(split(answers_tail, ";")) -> |_index, raw_rr| {
+            rr_text = strip_whitespace(raw_rr)
+            if rr_text != "" {
+              tokens = split(rr_text, " ")
+              if length(tokens) >= 5 {
+                # Strip trailing "." from name (BIND's FQDN form) to match
+                # Elastic's normalisation; also trim trailing "." from data.
+                rr_name = string!(tokens[0])
+                if ends_with(rr_name, ".") {
+                  rr_name = slice!(rr_name, 0, length(rr_name) - 1)
+                }
+                rr_class_str = string!(tokens[2])
+                rr_type_str  = string!(tokens[3])
+                data_tokens, _slice_err = slice(tokens, 4)
+                rr_data = join!(data_tokens, " ")
+                if ends_with(rr_data, ".") {
+                  rr_data = slice!(rr_data, 0, length(rr_data) - 1)
+                }
+                rr_ttl, ttl_err = to_int(string!(tokens[1]))
+                rr_record = {
+                  "name":  rr_name,
+                  "class": rr_class_str,
+                  "type":  rr_type_str,
+                  "data":  rr_data,
+                }
+                if ttl_err == null {
+                  rr_record = set!(rr_record, ["ttl"], rr_ttl)
+                }
+                rr_list = push(rr_list, rr_record)
+                related_hosts = push(related_hosts, rr_name)
+                if is_ipv4(rr_data) || is_ipv6(rr_data) {
+                  related_ips = push(related_ips, rr_data)
+                }
+              }
+            }
+          }
+          if length(rr_list) > 0 {
+            .dns.answers = rr_list
+          }
+        }
+
+        # ── related.* aggregations (ECS recommended) ──
+        # Combine answer hosts/IPs with the question name and client/server
+        # IPs so cross-event correlation queries hit on any of them.
+        related_hosts = push(related_hosts, question_name)
+        .related.hosts = related_hosts
+        related_ips = push(related_ips, client_ip_str)
+        if .server.ip != null {
+          related_ips = push(related_ips, string!(.server.ip))
+        }
+        .related.ip = related_ips
+
+        # ── @timestamp from the BIND sub-second timestamp ──
+        # The Infoblox payload carries millisecond precision; the syslog
+        # envelope only has second precision. Per Elastic's pipeline_dns.yml,
+        # the BIND ts wins. Format is "%d-%b-%Y %H:%M:%S%.3f", UTC assumed
+        # (Elastic's date processor uses UTC when event.timezone is unset).
+        bind_ts, ts_err = parse_timestamp(
+          bind_ts_str,
+          format: "%d-%b-%Y %H:%M:%S%.3f"
+        )
+        if ts_err == null {
+          .@timestamp = bind_ts
+        }
+
+        # ── ECS event categorization ──
+        # DNS responses are network/protocol info events; outcome derives
+        # from response_code (NOERROR ⇒ success, anything else ⇒ failure).
+        .event.kind     = "event"
+        .event.category = ["network"]
+        .event.type     = ["info", "protocol"]
+        .event.action   = "dns-response"
+        .event.outcome  = if response_code == "NOERROR" {
+          "success"
+        } else {
+          "failure"
+        }
+      }
+
+      # ── cleanup ──
+      # The raw .message is now redundant (event.original holds the syslog
+      # line, the parsed fields hold the structured view). Drop it to
+      # avoid a non-ECS scalar at the root.
+      del(.message)
+  # ── dns-queries partition ──
+  remap_dns_queries:
+    type: remap
+    inputs:
+      - "route_partitions.dns_queries"
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── parse the BIND-named queries-channel payload ──
+      # Contract: upstream `adapt_syslog` has already extracted the syslog
+      # envelope into .process.name / .host.* / .@timestamp / .log.syslog.* /
+      # .event.original. .message is the plain BIND queries-channel payload.
+      #
+      # Format (across this partition's samples; BIND's `queries` channel
+      # logs the question only — no answers section):
+      #   "queries: client @<hex_ptr> <client_ip>#<client_port>
+      #     (<qname_paren>): [view <N>: ]query: <qname> <class> <type>
+      #     <flags> (<resolver_ip>)"
+      # The "@<hex_ptr>" is BIND's internal client struct pointer — noise.
+      # The qname appears twice (in parens and after "query:"); we keep
+      # the post-"query:" copy as authoritative because it's the field
+      # BIND uses to drive matching/logging downstream.
+      #
+      # Real-world variations that relax the iter-1 anchor:
+      #   * The "view <N>:" segment is absent on appliances without
+      #     split-horizon views, and on version.bind / chaos-class probes.
+      #     We make it an optional non-capturing group.
+      #   * The class token is not always IN — Chaos (CH) class shows up
+      #     for version.bind / hostname.bind / id.server recon probes;
+      #     HS, NONE, ANY are also legal DNS classes. Accept the standard
+      #     alternation rather than anchoring to IN.
+      #   * The qname_paren capture (the duplicate qname BIND prints in
+      #     parentheses before "view <N>:") can contain backslash-escaped
+      #     parens or octal escapes, e.g. `_dcimprovsrv._tcp.\(none\)`.
+      #     The earlier `[^)]*` capture stopped at the first `\)` glyph;
+      #     extend it to `(?:\\.|[^)])*` so escaped chars are absorbed
+      #     and only an *unescaped* `)` closes the group (iter-5).
+      #   * Public-view queries from external recursive resolvers
+      #     carry an EDNS Client Subnet annotation appended after the
+      #     resolver-ip paren as "[ECS <subnet>/<scope1>/<scope2>]". This
+      #     is BIND's rendering of the RFC 7871 ECS option the upstream
+      #     resolver attached to the query — a hint about the originating
+      #     client's network. The whole bracket group is optional; we
+      #     capture the inner annotation into a vendor field and leave it
+      #     unset on internal-view events that lack the suffix.
+      #
+      # Strip trailing whitespace first — Vector's regex anchors $ at
+      # end-of-input, not before \n, and upstream may keep the trailing \n
+      # on .message.
+      bind_message = strip_whitespace(string!(.message))
+      bind_payload, parse_err = parse_regex(
+        bind_message,
+        r'^queries:\s+client\s+@\S+\s+(?P<client_ip>\S+)#(?P<client_port>\d+)\s+\((?P<qname_paren>(?:\\.|[^)])*)\):\s+(?:view\s+(?P<view>\S+):\s+)?query:\s+(?P<qname>\S+)\s+(?P<qclass>IN|CH|HS|NONE|ANY)\s+(?P<qtype>\S+)\s+(?P<flags>\S+)\s+\((?P<resolver_ip>\S+)\)(?:\s+\[ECS\s+(?P<ecs_subnet>[^\]]+)\])?$'
+      )
+
+      if parse_err != null {
+        # ── fallback: keep the event but mark it ──
+        # Gate 2 forbids drops; on regex miss we tag and continue.
+        .event.kind = "pipeline_error"
+        .event.category = ["host"]
+        .event.type = ["info", "error"]
+        .event.outcome = "failure"
+        .tags = push(array(.tags) ?? [], "_parse_failure")
+        .error = { "type": "parse_failure", "message": parse_err }
+      } else {
+        # parse_regex captures are typed `string | undefined`; coerce to
+        # plain string up front so downstream ops are infallible.
+        question_name      = downcase(string!(bind_payload.qname))
+        question_class     = string!(bind_payload.qclass)
+        question_type      = string!(bind_payload.qtype)
+        raw_flags          = string!(bind_payload.flags)
+        client_ip_str      = string!(bind_payload.client_ip)
+        client_port_int    = to_int!(string!(bind_payload.client_port))
+        resolver_ip_str    = string!(bind_payload.resolver_ip)
+
+        # ── DNS question ──
+        # No response section in the queries channel — only the question
+        # is populated. ECS recommends lowercase question names; BIND can
+        # mix case (e.g. PTR reverse-lookup labels). Class is preserved
+        # verbatim (IN/CH/HS/...) — chaos-class probes such as
+        # version.bind are categorised as ordinary DNS queries; the
+        # class field itself is the recon-traffic signal.
+        .dns.question.name  = question_name
+        .dns.question.class = question_class
+        .dns.question.type  = question_type
+
+        # ── DNS header flags ──
+        # The flags token in the queries channel is a compact glyph string
+        # (e.g. "+", "+E(0)", "-ED"). Per Elastic pipeline_dns.yml's
+        # painless mapping: A→AA, t→TC, C→CD, D→DO, and "+" decodes to RD
+        # for queries (no response present yet — the queries channel only
+        # logs the inbound question). E (EDNS) is recorded under the
+        # vendor namespace below; ECS dns.header_flags only tracks the
+        # standardized DNS header flag bits.
+        decoded_flags = []
+        if contains(raw_flags, "A") { decoded_flags = push(decoded_flags, "AA") }
+        if contains(raw_flags, "t") { decoded_flags = push(decoded_flags, "TC") }
+        if contains(raw_flags, "C") { decoded_flags = push(decoded_flags, "CD") }
+        if contains(raw_flags, "D") { decoded_flags = push(decoded_flags, "DO") }
+        if contains(raw_flags, "+") {
+          decoded_flags = push(decoded_flags, "RD")
+        }
+        if length(decoded_flags) > 0 {
+          .dns.header_flags = decoded_flags
+        }
+
+        # ── network identifiers ──
+        # The queries channel doesn't carry a UDP/TCP token (unlike the
+        # responses channel), so network.transport is intentionally
+        # omitted here. network.protocol stays "dns".
+        .network.protocol = "dns"
+
+        # ── client (DNS query originator) ──
+        # parse_regex captures are strings; ECS client.port is long.
+        .client.ip   = client_ip_str
+        .client.port = client_port_int
+
+        # ── server (the NIOS appliance receiving the query) ──
+        # The trailing "(<resolver_ip>)" in the BIND payload is the
+        # appliance IP that handled the lookup. Prefer it over host.ip
+        # because it's payload-authoritative, but fall back to host.ip
+        # when needed. Both should agree in practice.
+        .server.ip = resolver_ip_str
+
+        # ── view name + raw flag glyph (Infoblox-specific) ──
+        # The view is an Infoblox concept (split-horizon DNS); it has no
+        # ECS slot, so it lives under the vendor namespace. The view
+        # segment is optional in the BIND payload — appliances without
+        # split-horizon (and chaos-class probes like version.bind) omit
+        # it entirely. Only emit the field when the capture fired so we
+        # don't write a literal "null" into the vendor namespace.
+        if bind_payload.view != null {
+          .infoblox_nios.log.view = string!(bind_payload.view)
+        }
+        .infoblox_nios.log.dns.header_flags = raw_flags
+
+        # ── EDNS Client Subnet (RFC 7871) ──
+        # Only present on public-view queries forwarded by an
+        # external recursive resolver. The annotation is the upstream
+        # resolver's hint about the originating client network and is
+        # rendered by BIND as "<subnet>/<source-prefix>/<scope-prefix>".
+        # ECS has no schema slot for it, so park it under the vendor
+        # namespace verbatim; analysts can split the slashes downstream
+        # if needed. Real branch on presence: the field is only set on
+        # the public-view subset, so absence is meaningful and we must
+        # not write a literal "null".
+        if bind_payload.ecs_subnet != null {
+          .infoblox_nios.dns.ecs_subnet = string!(bind_payload.ecs_subnet)
+        }
+
+        # ── related.* aggregations (ECS recommended) ──
+        # Cross-event correlation indices: pivot from any IP/host involved.
+        .related.hosts = [question_name]
+        .related.ip    = [client_ip_str, resolver_ip_str]
+
+        # ── ECS event categorization ──
+        # DNS queries are network/protocol info events. event.outcome is
+        # "unknown" because the queries channel only logs the inbound
+        # question — we don't yet know whether the resolver succeeded.
+        .event.kind     = "event"
+        .event.category = ["network"]
+        .event.type     = ["info", "protocol"]
+        .event.action   = "dns-query"
+        .event.outcome  = "unknown"
+      }
+
+      # ── @timestamp ──
+      # The Infoblox queries channel does NOT carry a sub-second
+      # timestamp in the payload (unlike the responses channel). The
+      # syslog envelope @timestamp (set upstream by adapt_syslog) is the
+      # best precision available; no override needed here.
+
+      # ── cleanup ──
+      # The raw .message is now redundant (event.original holds the
+      # syslog line, the parsed fields hold the structured view). Drop
+      # it to avoid a non-ECS scalar at the root.
+      del(.message)
+  # ── dhcp partition ──
+  remap_dhcp:
+    type: remap
+    inputs:
+      - "route_partitions.dhcp"
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── parse the dhcpd payload ──
+      # Contract: upstream `adapt_syslog` has already extracted the syslog
+      # envelope into .process.name / .host.* / .@timestamp / .log.syslog.* /
+      # .event.original. .message is the plain ISC dhcpd payload string.
+      #
+      # Sub-shapes handled (verbs covered: ACK, OFFER, NAK, DECLINE,
+      # EXPIRE, RELEASE share the long form; REQUEST, Option 82, and
+      # the bare ACK short form have their own branches; iter-4 adds
+      # bare DHCPDISCOVER, DDNS forward/reverse map updates, and the
+      # lease-pool free-list housekeeping line; iter-6 adds DDNS
+      # forward/reverse map *removals* and a bare DHCPEXPIRE shape):
+      #   1. DHCP<VERB> on <ip> to <mac> [(<hostname>)] via <iface>
+      #      [relay <relay>] [lease-duration <secs>]
+      #      [offered-duration <secs>] [(<state>)] [uid <uid>]
+      #   2. DHCPACK to <ip> (<mac>) via <iface>          (short form, no relay)
+      #   3. DHCPREQUEST for <ip> from <mac> [(<hostname>)] via <relay_or_iface>
+      #      [TransID <hex>] [uid <uid>] [(<state>)]
+      #   4. Option 82: received a <kind> DHCP packet from relay-agent <ip>
+      #      with a circuit-id of "<cid>", a remote-id of "<rid>" for <ip>
+      #      (<mac>) lease time is <secs|undefined> seconds. (<state>)
+      #   5. DHCPDISCOVER from <mac> via <relay-or-iface> TransID <hex>
+      #   6. Added new forward map from <fqdn> to <ip> by server <ip>#<port>
+      #   7. Added reverse map from <ptr-name>. to <fqdn> by server <ip>#<port>
+      #   8. <ip>: removing client association (free) uid=<uid> hw=<mac>
+      # We branch on the leading token so each sub-shape gets its own,
+      # readable regex. Strip trailing whitespace first — Vector's regex
+      # anchors $ at end-of-input, not before \n, and upstream may keep the
+      # trailing \n on .message.
+      dhcpd_message = strip_whitespace(string!(.message))
+
+      # ── preflight: drop "Lease state active. Not abandoning <ip>" noise (iter-7) ──
+      # ISC dhcpd / Infoblox emits this diagnostic line on every release/expire
+      # path where the lease was still marked active in the binding state — it
+      # always pairs with a richer DHCPRELEASE/DHCPEXPIRE event a fraction of a
+      # second later, and carries no fields the matched lease event doesn't
+      # already carry. Authorized for drop in docs/infoblox-authorized-drops.md.
+      # drop_on_abort on this transform turns the abort into a clean drop.
+      if starts_with(dhcpd_message, "Lease state active. Not abandoning ") {
+        abort "noise:lease-state-active"
+      }
+
+      # ── preflight: drop dhcpd self-stats noise (iter-8) ──
+      # dhcpd emits two periodic operational-stats lines that have no SIEM
+      # signal — already covered by Vector / k8s metrics and would otherwise
+      # generate one event per minute per appliance:
+      #   "Average 5/15/60/1440 dynamic DNS update latency: <us>/<us>/<us>/<us> micro seconds"
+      #   "Dynamic DNS update timeout count in last 5/15/60/1440 minutes: <n>/<n>/<n>/<n>"
+      # plus a one-shot startup notice on a stand-by appliance:
+      #   "Lease publishing disabled"
+      # Authorized for drop in docs/infoblox-authorized-drops.md.
+      if starts_with(dhcpd_message, "Average ") && contains(dhcpd_message, "dynamic DNS update latency:") {
+        abort "noise:dhcpd-stats-latency"
+      }
+      if starts_with(dhcpd_message, "Dynamic DNS update timeout count ") {
+        abort "noise:dhcpd-stats-timeout"
+      }
+      if dhcpd_message == "Lease publishing disabled" {
+        abort "noise:lease-publishing-disabled"
+      }
+
+      # ── preflight: drop DDNS internal cleanup diagnostics (iter-8) ──
+      # ISC dhcpd emits this trace line whenever the DDNS update state
+      # machine cancels a pending lease pointer. The cb=<hex> is an
+      # internal callback address used by the developers; no SIEM signal,
+      # no client/IP context. Always paired with a richer DDNS event a
+      # fraction of a second later. Authorized for drop.
+      if starts_with(dhcpd_message, "DDNS: cleaning up lease pointer ") {
+        abort "noise:ddns-cleanup-internal"
+      }
+
+      # ── preflight: drop dhcpd duplicate-uid binding diagnostic ──
+      # Shape: "uid lease <ip> for client <mac> is duplicate on <cidr>"
+      # ISC dhcpd emits this from its binding-database reconciler when the
+      # same DHCP client uid already has a lease on a different subnet —
+      # an internal housekeeping notice. Always paired with the richer
+      # lease event (DHCPACK/RELEASE/EXPIRE) seconds later, which already
+      # carries the IP and MAC. Authorized drop (docs/infoblox-authorized-drops.md).
+      if starts_with(dhcpd_message, "uid lease ") &&
+         contains(dhcpd_message, " is duplicate on ") {
+        abort "noise:dhcpd-uid-duplicate"
+      }
+
+      # default state in case nothing matches
+      parse_err = null
+      action_token = ""
+      leased_ip = null
+      client_mac_raw = null
+      client_hostname = null
+      iface = null
+      relay_ip = null
+      lease_duration_str = null
+      offered_duration_str = null
+      transaction_id = null
+      inform_source_ip = null
+      client_uid = null
+      lease_state = null
+      circuit_id = null
+      remote_id = null
+      option82_kind = null
+      lease_found = null
+      warning_text = null
+      ddns_direction = null
+      ddns_fqdn = null
+      ddns_target_ip = null
+      ddns_ptr_name = null
+      ddns_server_ip = null
+      ddns_server_port = null
+      server_id_ip = null
+      dhcp_status_text = null
+      ddns_reason = null
+      ddns_failure_server = null
+
+      # ── dhcpd warning preflight ──
+      # ISC dhcpd / Infoblox emit a handful of internal warnings on the
+      # same syslog channel as lease events ("label length exceeds 63 in
+      # fqdn option", "parse error ...", "bad ..."). They carry no client
+      # context, so they don't fit any DHCP<verb> shape. Classify them as
+      # host-info warnings up front so they don't fall into the
+      # unrecognised fallback. Anything not matching a known prefix
+      # continues to the main parse chain below.
+      is_dhcpd_warning =
+        starts_with(dhcpd_message, "label length") ||
+        starts_with(dhcpd_message, "parse error") ||
+        starts_with(dhcpd_message, "bad ")
+
+      if is_dhcpd_warning {
+        action_token = "dhcpd-warning"
+        warning_text = dhcpd_message
+      } else if match(dhcpd_message, r'^DHCPEXPIRE on \S+ to\s*$') {
+        # ── truncated DHCPEXPIRE (iter-8) ──
+        # Production has surfaced a truncated form that ends right after
+        # `to ` — the MAC and remaining lease tokens were lost in transit
+        # (likely a syslog-relay buffer cut). The leased IP is intact,
+        # which is enough to correlate with the surrounding lease history;
+        # tag the event `_truncated` so SOC sees the truncation rather
+        # than have it silently swallowed. Must come *before* the
+        # long-form DHCP<verb> branch — otherwise the long-form regex
+        # would drag the event into its own (failing) parse path.
+        action_token = "dhcp-expire"
+        trunc, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPEXPIRE on (?P<leased_ip>\S+) to\s*$'
+        )
+        if parse_err == null {
+          leased_ip = string!(trunc.leased_ip)
+          .tags = push(array(.tags) ?? [], "_truncated")
+        }
+      } else if match(dhcpd_message, r'^(?:DHCP)?(ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on ') {
+        # ── DHCP <verb> long form: server-side server→client lease event ──
+        # ISC dhcpd emits the same on-the-wire shape for ACK / OFFER /
+        # NAK / DECLINE / EXPIRE / RELEASE. We capture the verb and let
+        # downstream categorization decide outcome / type. OFFER carries
+        # an extra "offered-duration" token; ACK on RENEW carries a
+        # "(RENEW)" state and "uid <hex>" — both optional in the regex.
+        # Trailing-slot relaxation (iter-6): dhcpd's lease-database
+        # housekeeping path emits a bare `DHCPEXPIRE on <ip> to <mac>`
+        # with no via/relay/lease-duration tokens. Make the entire
+        # `via <iface>` segment optional so the same regex covers both
+        # the rich handshake form and the bare housekeeping form.
+        dhcp_long, parse_err = parse_regex(
+          dhcpd_message,
+          r'^(?:DHCP)?(?P<verb>ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on (?P<leased_ip>\S+) to (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?(?:\s+offered-duration\s+(?P<offered>\d+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s+uid\s+(?P<uid>\S+))?$'
+        )
+        if parse_err == null {
+          action_token = "dhcp-" + downcase(string!(dhcp_long.verb))
+          leased_ip = string!(dhcp_long.leased_ip)
+          client_mac_raw = string!(dhcp_long.mac)
+          if dhcp_long.hostname != null { client_hostname = string!(dhcp_long.hostname) }
+          if dhcp_long.iface != null { iface = string!(dhcp_long.iface) }
+          # Infoblox sometimes emits the literal interface name in the
+          # "relay" slot (e.g. "relay eth2") rather than a relay IP.
+          # Only treat the captured token as a relay IP when it actually
+          # looks like a dotted-quad; otherwise drop it (the iface field
+          # already carries the interface name).
+          if dhcp_long.relay != null {
+            relay_token = string!(dhcp_long.relay)
+            if match(relay_token, r'^\d+\.\d+\.\d+\.\d+$') {
+              relay_ip = relay_token
+            }
+          }
+          if dhcp_long.lease != null { lease_duration_str = string!(dhcp_long.lease) }
+          if dhcp_long.offered != null { offered_duration_str = string!(dhcp_long.offered) }
+          if dhcp_long.state != null { lease_state = string!(dhcp_long.state) }
+          if dhcp_long.uid != null { client_uid = string!(dhcp_long.uid) }
+        }
+      } else if starts_with(dhcpd_message, "DHCPRELEASE of ") {
+        # ── DHCPRELEASE of/from: Infoblox internal release path ──
+        # Distinct from the long-form "DHCPRELEASE on <ip> to <mac>" above:
+        # this shape uses "of <ip> from <mac>", carries an optional
+        # "(found)" lease-found marker between the interface and the
+        # trailing TransID, and never includes relay/lease-duration
+        # tokens. Treat as a normal release event.
+        action_token = "dhcp-release"
+        dhcprelease_of, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPRELEASE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<iface>\S+)(?:\s+\((?P<found>found)\))?(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+        )
+        if parse_err == null {
+          leased_ip = string!(dhcprelease_of.leased_ip)
+          client_mac_raw = string!(dhcprelease_of.mac)
+          if dhcprelease_of.hostname != null { client_hostname = string!(dhcprelease_of.hostname) }
+          iface = string!(dhcprelease_of.iface)
+          if dhcprelease_of.found != null { lease_found = true }
+          if dhcprelease_of.transid != null { transaction_id = string!(dhcprelease_of.transid) }
+          if dhcprelease_of.uid != null { client_uid = string!(dhcprelease_of.uid) }
+        }
+      } else if starts_with(dhcpd_message, "DHCPACK to ") {
+        # ── DHCPACK short form: bare ack with no relay/lease metadata ──
+        action_token = "dhcp-ack"
+        dhcpack_short, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPACK to (?P<leased_ip>\S+) \((?P<mac>[0-9a-fA-F:]+)\) via (?P<iface>\S+)$'
+        )
+        if parse_err == null {
+          leased_ip = string!(dhcpack_short.leased_ip)
+          client_mac_raw = string!(dhcpack_short.mac)
+          iface = string!(dhcpack_short.iface)
+        }
+      } else if starts_with(dhcpd_message, "DHCPREQUEST ") {
+        # ── DHCPREQUEST: client renewing/requesting a lease ──
+        # SELECTING-state requests echo DHCP option 54 ("server identifier")
+        # right after the requested IP, producing the shape
+        # `for <leased_ip> (<server_id_ip>) from <mac> ...`. Capture the
+        # server-id when present so SOC can correlate which DHCP server the
+        # client picked; the capture is optional — bare RENEW/REBINDING
+        # requests omit it.
+        action_token = "dhcp-request"
+        dhcpreq, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPREQUEST for (?P<leased_ip>\S+)(?:\s+\((?P<server_id>\d+\.\d+\.\d+\.\d+)\))?\s+from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s*:\s*(?P<status_text>.+?))?$'
+        )
+        if parse_err == null {
+          leased_ip = string!(dhcpreq.leased_ip)
+          client_mac_raw = string!(dhcpreq.mac)
+          # ── DHCP option 54 server-identifier (real branch on presence) ──
+          # Only SELECTING-state requests carry the server-id echo; capture
+          # it into a vendor field downstream so SOC can see which DHCP
+          # server the client picked vs. which answered.
+          if dhcpreq.server_id != null {
+            server_id_ip = string!(dhcpreq.server_id)
+          }
+          if dhcpreq.hostname != null { client_hostname = string!(dhcpreq.hostname) }
+          # In DHCPREQUEST, the "via" token is either an interface name
+          # (e.g. eth2) or a relay IP (e.g. 192.0.2.254). Branch on
+          # whether it parses as an IPv4 to put it in the right slot.
+          via_token = string!(dhcpreq.via)
+          if match(via_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = via_token
+          } else {
+            iface = via_token
+          }
+          if dhcpreq.transid != null { transaction_id = string!(dhcpreq.transid) }
+          if dhcpreq.uid != null { client_uid = string!(dhcpreq.uid) }
+          if dhcpreq.state != null { lease_state = string!(dhcpreq.state) }
+          # ── trailing diagnostic text (iter-7) ──
+          # Some Infoblox firmwares append a colon-prefixed reason after a
+          # DHCPREQUEST when the server can't honour it (e.g. "wrong network.",
+          # "lease unavailable."). Capture verbatim under the vendor namespace
+          # so SOC can pivot on the failure cause; the trailing status also
+          # flips event.outcome to failure downstream.
+          if dhcpreq.status_text != null {
+            dhcp_status_text = strip_whitespace(string!(dhcpreq.status_text))
+          }
+        }
+      } else if starts_with(dhcpd_message, "DHCPDISCOVER from ") {
+        # ── DHCPDISCOVER: bare client discovery, no lease yet ──
+        # Issued by the client at handshake start; dhcpd hasn't picked an
+        # offer IP, so this shape carries only the client MAC, an optional
+        # client hostname (`(<hostname>)` from DHCP option 12), the relay
+        # slot (IP or interface), a TransID, and an optional uid (DHCP
+        # option 61). Outcome is "unknown" — an OFFER/ACK pair (or a
+        # DECLINE) decides the eventual result. Distinct from the long-form
+        # "DHCP<verb> on <ip> to <mac>" branch above because there is no
+        # "on <ip>" token to anchor on.
+        action_token = "dhcp-discover"
+        dhcpdiscover, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPDISCOVER from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+        )
+        if parse_err == null {
+          client_mac_raw = string!(dhcpdiscover.mac)
+          if dhcpdiscover.hostname != null { client_hostname = string!(dhcpdiscover.hostname) }
+          via_token = string!(dhcpdiscover.via)
+          if match(via_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = via_token
+          } else {
+            iface = via_token
+          }
+          if dhcpdiscover.transid != null { transaction_id = string!(dhcpdiscover.transid) }
+          if dhcpdiscover.uid != null { client_uid = string!(dhcpdiscover.uid) }
+        }
+      } else if starts_with(dhcpd_message, "DHCPINFORM ") {
+        # ── DHCPINFORM: bound client requesting additional config ──
+        # The client already has an IP (statically configured or previously
+        # leased) and is asking for non-address parameters (DNS, NTP, …).
+        # No "to <mac>" or "(<hostname>)" token — only source IP, via, TransID.
+        # SIEM-relevant: ties an IP-in-use to a transaction, surfaces hosts
+        # whose addresses didn't come from this DHCP server's lease pool.
+        action_token = "dhcp-inform"
+        dhcpinform, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPINFORM from (?P<src_ip>\S+)\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+        )
+        if parse_err == null {
+          inform_source_ip = string!(dhcpinform.src_ip)
+          via_token = string!(dhcpinform.via)
+          if match(via_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = via_token
+          } else {
+            iface = via_token
+          }
+          if dhcpinform.transid != null { transaction_id = string!(dhcpinform.transid) }
+          if dhcpinform.uid != null { client_uid = string!(dhcpinform.uid) }
+        }
+      } else if starts_with(dhcpd_message, "Option 82:") {
+        # ── Option 82: relay-agent annotation seen on incoming DHCP packet ──
+        # Iter-7 widening: the relay-agent token may be an interface name
+        # (e.g. "eth2") rather than a dotted-quad relay IP, and the
+        # remote-id segment is optional — Infoblox firmware variants emit
+        # circuit-id-only annotations for some hardware. Branch the
+        # captured relay token into option82.relay_ip vs .option82.relay_iface
+        # downstream so SOC keeps both shapes queryable.
+        action_token = "dhcp-option82"
+        opt82, parse_err = parse_regex(
+          dhcpd_message,
+          r'^Option 82: received a (?P<kind>\S+) DHCP packet from relay-agent (?P<relay>\S+) with a circuit-id of "(?P<cid>[^"]*)"(?:, a remote-id of "(?P<rid>[^"]*)")? for (?P<leased_ip>\S+) \((?P<mac>[0-9a-fA-F:]+)\) lease time is (?P<lease>\S+) seconds\.\s*(?:\((?P<state>[^)]*)\))?$'
+        )
+        if parse_err == null {
+          option82_kind = string!(opt82.kind)
+          relay_token = string!(opt82.relay)
+          # Route the relay slot: dotted-quad → relay_ip, anything else →
+          # relay_iface. Both surface under infoblox_nios.dhcp.option82.* in
+          # the emit block below.
+          if match(relay_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = relay_token
+          } else {
+            iface = relay_token
+          }
+          circuit_id = string!(opt82.cid)
+          if opt82.rid != null { remote_id = string!(opt82.rid) }
+          leased_ip = string!(opt82.leased_ip)
+          client_mac_raw = string!(opt82.mac)
+          lease_token = string!(opt82.lease)
+          if lease_token != "undefined" { lease_duration_str = lease_token }
+          if opt82.state != null { lease_state = string!(opt82.state) }
+        }
+      } else if starts_with(dhcpd_message, "Added ") {
+        # ── DDNS map update: dhcpd asking BIND to add an A or PTR ──
+        # After a successful lease dhcpd emits these as it pushes the
+        # A (forward) or PTR (reverse) record into its configured DNS
+        # server. Two sub-shapes share the "Added " prefix; split on
+        # whether the next tokens are "new forward map" or "reverse map".
+        # Both end with "by server <ip>#<port>" — capture the BIND
+        # endpoint so SOC can correlate DDNS pushes against BIND logs.
+        # We synthesise client.ip from the recorded data so these events
+        # are pivotable alongside lease events: forward → target_ip,
+        # reverse → octet-reversed in-addr.arpa label.
+        if starts_with(dhcpd_message, "Added new forward map ") {
+          action_token = "ddns-add-forward"
+          ddns_direction = "forward"
+          ddns_forward, parse_err = parse_regex(
+            dhcpd_message,
+            r'^Added new forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server (?P<server_ip>\S+)#(?P<server_port>\d+)$'
+          )
+          if parse_err == null {
+            ddns_fqdn = string!(ddns_forward.fqdn)
+            ddns_target_ip = string!(ddns_forward.target_ip)
+            ddns_server_ip = string!(ddns_forward.server_ip)
+            ddns_server_port = string!(ddns_forward.server_port)
+          }
+        } else if starts_with(dhcpd_message, "Added reverse map ") {
+          action_token = "ddns-add-reverse"
+          ddns_direction = "reverse"
+          ddns_reverse, parse_err = parse_regex(
+            dhcpd_message,
+            r'^Added reverse map from (?P<ptr_name>\S+?)\.?\s+to\s+(?P<fqdn>.+?) by server (?P<server_ip>\S+)#(?P<server_port>\d+)$'
+          )
+          if parse_err == null {
+            ddns_ptr_name = string!(ddns_reverse.ptr_name)
+            ddns_fqdn = string!(ddns_reverse.fqdn)
+            ddns_server_ip = string!(ddns_reverse.server_ip)
+            ddns_server_port = string!(ddns_reverse.server_port)
+          }
+        } else {
+          parse_err = "unrecognised Added-prefixed dhcpd message"
+        }
+      } else if starts_with(dhcpd_message, "Removed ") {
+        # ── DDNS map removal: dhcpd asking BIND to drop an A or PTR ──
+        # Counterpart of the "Added " branch above; emitted on lease
+        # expiry / release when dhcpd cleans up the matching DNS records.
+        # Two sub-shapes share the "Removed " prefix:
+        #   * "Removed forward map from <fqdn> to <ip> by server <ip>#<port>"
+        #     — same shape as the Added-forward variant; carries the
+        #     hostname and the previously-leased IP. Action ddns-remove-forward.
+        #   * "Removed reverse map on <ptr-name>." — distinct shape: no
+        #     destination FQDN, no server tuple. Just the PTR label that
+        #     was retired. We still derive client.ip via octet-reverse so
+        #     the event is pivotable alongside the matching lease teardown.
+        #     Action ddns-remove-reverse.
+        if starts_with(dhcpd_message, "Removed forward map ") {
+          action_token = "ddns-remove-forward"
+          ddns_direction = "forward"
+          ddns_remove_forward, parse_err = parse_regex(
+            dhcpd_message,
+            r'^Removed forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server (?P<server_ip>\S+)#(?P<server_port>\d+)$'
+          )
+          if parse_err == null {
+            ddns_fqdn = string!(ddns_remove_forward.fqdn)
+            ddns_target_ip = string!(ddns_remove_forward.target_ip)
+            ddns_server_ip = string!(ddns_remove_forward.server_ip)
+            ddns_server_port = string!(ddns_remove_forward.server_port)
+          }
+        } else if starts_with(dhcpd_message, "Removed reverse map on ") {
+          action_token = "ddns-remove-reverse"
+          ddns_direction = "reverse"
+          ddns_remove_reverse, parse_err = parse_regex(
+            dhcpd_message,
+            r'^Removed reverse map on (?P<ptr_name>\S+?)\.?$'
+          )
+          if parse_err == null {
+            ddns_ptr_name = string!(ddns_remove_reverse.ptr_name)
+          }
+        } else {
+          parse_err = "unrecognised Removed-prefixed dhcpd message"
+        }
+      } else if starts_with(dhcpd_message, "Reverse map update for ") {
+        # ── DDNS reverse-map update abandoned (iter-7) ──
+        # ISC dhcpd emits this when the periodic background retry loop on a
+        # PTR (reverse) update gives up: the DNS server returned a
+        # non-retryable rcode (NXRRSET / REFUSED / FORMERR / etc.). Carries
+        # the leased IP and the failure reason. No client MAC, hostname, or
+        # server tuple — just the diagnostic. Outcome failure; SOC pivots on
+        # client.ip + reason to correlate with the original Added/Removed
+        # reverse-map event a few seconds earlier.
+        action_token = "ddns-reverse-abandoned"
+        ddns_direction = "reverse"
+        rev_abandon, parse_err = parse_regex(
+          dhcpd_message,
+          r'^Reverse map update for (?P<leased_ip>\S+) abandoned because of non-retryable failure:\s+(?P<reason>.+?)$'
+        )
+        if parse_err == null {
+          leased_ip = string!(rev_abandon.leased_ip)
+          ddns_reason = strip_whitespace(string!(rev_abandon.reason))
+        }
+      } else if starts_with(dhcpd_message, "Unable to add forward map ") {
+        # ── DDNS forward-map add failure (iter-8) ──
+        # Counterpart of the iter-7 reverse-add-failure branch and of
+        # "Added new forward map …": dhcpd tried to push an A record into
+        # BIND, the upstream rejected it. Format:
+        #   Unable to add forward map from <fqdn> to <ip> by server <ip>#<port>: <reason>
+        #   Unable to add forward map from <fqdn> to <ip> by server <unknown address, family 0>: <reason>
+        # The server slot is either the structured `<ip>#<port>` form or
+        # the literal `<unknown address, family 0>` token (no `#`). The
+        # fqdn capture allows spaces because Infoblox sometimes emits
+        # display names like "RECEIVER HOST123.example.com"; the trailing
+        # ` by server ` separator disambiguates. client.ip is derived
+        # from target_ip downstream so the event correlates with the
+        # matching lease.
+        action_token = "ddns-add-failed-forward"
+        ddns_direction = "forward"
+        fwd_fail, parse_err = parse_regex(
+          dhcpd_message,
+          r'^Unable to add forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server\s+(?P<server>.+?):\s+(?P<reason>.+?)$'
+        )
+        if parse_err == null {
+          ddns_fqdn = string!(fwd_fail.fqdn)
+          ddns_target_ip = string!(fwd_fail.target_ip)
+          ddns_reason = strip_whitespace(string!(fwd_fail.reason))
+          server_token = strip_whitespace(string!(fwd_fail.server))
+          # Structured `<ip>#<port>` populates server_ip/port; the
+          # `<unknown address, family 0>` shape lands in ddns_failure_server.
+          server_match, _smerr = parse_regex(
+            server_token,
+            r'^(?P<server_ip>\d+\.\d+\.\d+\.\d+)#(?P<server_port>\d+)$'
+          )
+          if _smerr == null {
+            ddns_server_ip = string!(server_match.server_ip)
+            ddns_server_port = string!(server_match.server_port)
+          } else {
+            ddns_failure_server = server_token
+          }
+        }
+      } else if starts_with(dhcpd_message, "Unable to add reverse map ") {
+        # ── DDNS reverse-map add failure (iter-7) ──
+        # Counterpart of "Added reverse map …": dhcpd tried to push a PTR
+        # into BIND, the upstream rejected it (timeout / SERVFAIL / unknown
+        # address / …). Format:
+        #   Unable to add reverse map from <ptr-name>. to <fqdn>: <reason>
+        #     by server <ip>#<port>      (well-formed server tuple)
+        #   Unable to add reverse map from <ptr-name>. to <fqdn>: <reason>
+        #     by server <unknown address, family 0>   (server unresolved)
+        # The `<unknown address ...>` form means the configured DNS server
+        # didn't resolve at the moment of the push — server.ip stays unset.
+        # We derive client.ip from the PTR octet-reverse exactly like the
+        # Added/Removed-reverse branches so the event correlates with the
+        # matching lease teardown.
+        action_token = "ddns-add-failed-reverse"
+        ddns_direction = "reverse"
+        rev_fail, parse_err = parse_regex(
+          dhcpd_message,
+          r'^Unable to add reverse map from (?P<ptr_name>\S+?)\.?\s+to\s+(?P<fqdn>.+?):\s+(?P<reason>.+?)\s+by server\s+(?P<server>.+?)$'
+        )
+        if parse_err == null {
+          ddns_ptr_name = string!(rev_fail.ptr_name)
+          ddns_fqdn = string!(rev_fail.fqdn)
+          ddns_reason = strip_whitespace(string!(rev_fail.reason))
+          server_token = strip_whitespace(string!(rev_fail.server))
+          # Well-formed BIND endpoint is "<ip>#<port>"; the unresolved form
+          # is the literal "<unknown address, family 0>" (no `#`). Only
+          # populate server_ip/server_port on the structured shape.
+          server_match, _smerr = parse_regex(
+            server_token,
+            r'^(?P<server_ip>\d+\.\d+\.\d+\.\d+)#(?P<server_port>\d+)$'
+          )
+          if _smerr == null {
+            ddns_server_ip = string!(server_match.server_ip)
+            ddns_server_port = string!(server_match.server_port)
+          } else {
+            ddns_failure_server = server_token
+          }
+        }
+      } else if starts_with(dhcpd_message, "Abandoning IP address ") {
+        # ── lease abandonment (iter-8) ──
+        # ISC dhcpd marks an address as abandoned when a client refuses an
+        # offer (DHCPDECLINE) or a probe finds it already in use. The
+        # server keeps the binding out of the pool until the abandonment
+        # timer expires. Format:
+        #   "Abandoning IP address <ip>: <reason>."
+        # Carries no client MAC (the matching DHCPDECLINE event a
+        # fraction of a second earlier carries that). Treat as a host
+        # lease-end failure event so SOC sees the pool churn.
+        action_token = "dhcp-abandon"
+        abandon, parse_err = parse_regex(
+          dhcpd_message,
+          r'^Abandoning IP address (?P<leased_ip>\d+\.\d+\.\d+\.\d+):\s+(?P<reason>.+?)\.?$'
+        )
+        if parse_err == null {
+          leased_ip = string!(abandon.leased_ip)
+          dhcp_status_text = strip_whitespace(string!(abandon.reason))
+        }
+      } else if match(dhcpd_message, r'^DHCPDECLINE of \S+ from ') {
+        # ── DHCPDECLINE of/from (iter-8) ──
+        # Distinct from the long-form "DHCPDECLINE on <ip> to <mac>" handled
+        # by the long-verb branch above: this shape uses "of <ip> from <mac>"
+        # like DHCPRELEASE-of/from, plus a trailing ": abandoned" status.
+        # Format:
+        #   "DHCPDECLINE of <ip> from <mac> [(<hostname>)] via <relay-or-iface>
+        #     [TransID <hex>] [uid <uid>]: abandoned"
+        # The trailing status text mirrors the dhcp-request status_text slot.
+        action_token = "dhcp-decline"
+        decline, parse_err = parse_regex(
+          dhcpd_message,
+          r'^DHCPDECLINE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s*:\s*(?P<status_text>.+?))?$'
+        )
+        if parse_err == null {
+          leased_ip = string!(decline.leased_ip)
+          client_mac_raw = string!(decline.mac)
+          if decline.hostname != null { client_hostname = string!(decline.hostname) }
+          via_token = string!(decline.via)
+          if match(via_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = via_token
+          } else {
+            iface = via_token
+          }
+          if decline.transid != null { transaction_id = string!(decline.transid) }
+          if decline.uid != null { client_uid = string!(decline.uid) }
+          if decline.status_text != null {
+            dhcp_status_text = strip_whitespace(string!(decline.status_text))
+          }
+        }
+      } else if match(dhcpd_message, r'^\d+\.\d+\.\d+\.\d+:\s+removing client association ') {
+        # ── lease-pool free-list housekeeping ──
+        # ISC dhcpd's pool-cleanup path emits this when a lease binding
+        # is freed (expired beyond grace, manual `omshell` delete, etc.).
+        # No syslog verb prefix — anchor on the leading IP. Carries the
+        # released IP, the client uid (DHCP option 61, includes the htype
+        # byte), and the bare hardware address. Treat as a lease-end
+        # event so SOC can correlate with subsequent re-leases.
+        action_token = "dhcp-free"
+        free_assoc, parse_err = parse_regex(
+          dhcpd_message,
+          r'^(?P<leased_ip>\d+\.\d+\.\d+\.\d+):\s+removing client association \(free\)\s+uid=(?P<uid>\S+)\s+hw=(?P<hw>[0-9a-fA-F:]+)$'
+        )
+        if parse_err == null {
+          leased_ip = string!(free_assoc.leased_ip)
+          client_uid = string!(free_assoc.uid)
+          client_mac_raw = string!(free_assoc.hw)
+        }
+      } else {
+        # ── unknown sub-shape ──
+        # Force the fallback path below; fabricate an err to flow through.
+        parse_err = "unrecognised dhcpd message shape"
+      }
+
+      if parse_err != null {
+        # ── fallback: keep the event but mark it ──
+        # Gate 2 forbids drops; on regex/shape miss we tag and continue.
+        .event.kind = "pipeline_error"
+        .event.category = ["host"]
+        .event.type = ["info", "error"]
+        .event.outcome = "failure"
+        .tags = push(array(.tags) ?? [], "_parse_failure")
+        .error = { "type": "parse_failure", "message": parse_err }
+      } else if action_token == "dhcpd-warning" {
+        # ── dhcpd warning event ──
+        # Internal dhcpd warning (e.g. "label length exceeds 63 in fqdn
+        # option"). No client context — emit a host-category info event
+        # with outcome=failure and stash the raw text under the vendor
+        # namespace so SOC can pivot on it.
+        .infoblox_nios.dhcp.warning_text = warning_text
+        .event.kind     = "event"
+        .event.category = ["host"]
+        .event.type     = ["info"]
+        .event.action   = action_token
+        .event.outcome  = "failure"
+      } else if ddns_direction != null {
+        # ── DDNS map update event ──
+        # Forward (A) or reverse (PTR) push from dhcpd to its configured
+        # BIND server. We map the DNS endpoint to server.ip / server.port,
+        # the leased host's name to host.hostname (so it joins related.hosts
+        # the same way a lease event would), and infer client.ip from the
+        # data: forward carries the target IP directly; reverse carries an
+        # in-addr.arpa label whose first 4 octets are the IP in reverse.
+        .infoblox_nios.dhcp.ddns.direction = ddns_direction
+        if ddns_fqdn != null {
+          .infoblox_nios.dhcp.ddns.fqdn = ddns_fqdn
+          .host.hostname = downcase(string!(ddns_fqdn))
+          .related.hosts = [downcase(string!(ddns_fqdn))]
+        }
+        if ddns_target_ip != null {
+          .infoblox_nios.dhcp.ddns.target_ip = ddns_target_ip
+          .client.ip = string!(ddns_target_ip)
+        }
+        if ddns_ptr_name != null {
+          .infoblox_nios.dhcp.ddns.ptr_name = ddns_ptr_name
+          # Reverse lookup name like "1.2.0.192.in-addr.arpa." — the
+          # first four labels are the IPv4 octets in reverse order. Split,
+          # take the leading 4, reverse, and re-join. If the shape is
+          # IPv6 (.ip6.arpa) we skip — that path needs a different parser.
+          ptr_labels = split(string!(ddns_ptr_name), ".")
+          if length(ptr_labels) >= 5 {
+            tail4 = slice!(ptr_labels, 0, 4)
+            o0 = string!(tail4[0])
+            o1 = string!(tail4[1])
+            o2 = string!(tail4[2])
+            o3 = string!(tail4[3])
+            inferred_ip = o3 + "." + o2 + "." + o1 + "." + o0
+            if match(inferred_ip, r'^\d+\.\d+\.\d+\.\d+$') {
+              .client.ip = inferred_ip
+            }
+          }
+        }
+        if ddns_server_ip != null { .infoblox_nios.dhcp.ddns.server_ip = ddns_server_ip }
+        if ddns_server_port != null {
+          .infoblox_nios.dhcp.ddns.server_port = to_int!(string!(ddns_server_port))
+        }
+        # ── DDNS failure context (iter-7) ──
+        # The "Reverse map update for <ip> abandoned because of non-retryable
+        # failure: <reason>" and "Unable to add reverse map ... : <reason> by
+        # server <unresolved>" branches surface a textual reason; record it
+        # so SOC can pivot on the failure cause without re-grepping
+        # event.original. ddns_failure_server holds the literal "<unknown
+        # address, family 0>" form (no `#port`) so the field stays distinct
+        # from the structured server tuple.
+        if ddns_reason != null { .infoblox_nios.dhcp.ddns.reason = ddns_reason }
+        if ddns_failure_server != null {
+          .infoblox_nios.dhcp.ddns.server = ddns_failure_server
+        }
+        # ── ddns-reverse-abandoned fallback for client.ip ──
+        # The abandonment shape doesn't carry a PTR name; the leased IP
+        # populated by the parse maps directly to client.ip when neither the
+        # forward target_ip nor the PTR-derived inference fired.
+        if .client.ip == null && leased_ip != null {
+          .client.ip = string!(leased_ip)
+        }
+
+        # ── related.ip aggregation ──
+        related_ips = []
+        if .client.ip != null { related_ips = push(related_ips, string!(.client.ip)) }
+        if ddns_server_ip != null { related_ips = push(related_ips, string!(ddns_server_ip)) }
+        if length(related_ips) > 0 { .related.ip = related_ips }
+
+        .network.protocol = "dhcp"
+        .event.kind     = "event"
+        .event.category = ["network"]
+        .event.type     = ["info", "change"]
+        .event.action   = action_token
+        # Add/Remove forward & reverse succeed; the iter-7 abandonment and
+        # add-failure branches are failures — the reason is stashed above.
+        if action_token == "ddns-reverse-abandoned" ||
+           action_token == "ddns-add-failed-reverse" ||
+           action_token == "ddns-add-failed-forward" {
+          .event.outcome = "failure"
+        } else {
+          .event.outcome = "success"
+        }
+      } else {
+        # ── ECS client.* (the leased / requesting / informing host) ──
+        # ECS recommends MAC notation as uppercase hex octets joined by
+        # hyphens; dhcpd emits lowercase colons. Translate.
+        # DHCPINFORM has no MAC and no leased IP — it carries the client's
+        # already-bound source IP instead. Pick whichever the parser set.
+        if leased_ip != null {
+          .client.ip = leased_ip
+        } else if inform_source_ip != null {
+          .client.ip = inform_source_ip
+        }
+        if client_mac_raw != null {
+          .client.mac = upcase(replace(string!(client_mac_raw), ":", "-"))
+        }
+        if client_hostname != null {
+          # ECS host.hostname is the lowercased short hostname of the
+          # *event source*. For a leased client it's the cleanest fit
+          # ECS offers; the bracketed token is the client's name as
+          # known to the DHCP server (e.g. "L0164259", "LAPTOP-9BV9USIT").
+          .host.hostname = downcase(string!(client_hostname))
+          .related.hosts = [downcase(string!(client_hostname))]
+        }
+
+        # ── network identifiers ──
+        # DHCP runs over UDP; IANA protocol number 17. The transport is
+        # a property of the protocol, not the message — hard-code it.
+        .network.protocol = "dhcp"
+        .network.transport = "udp"
+        .network.iana_number = "17"
+
+        # ── related.ip aggregation (ECS recommended) ──
+        # Index every IP that appears in the event for cross-event pivots.
+        related_ips = []
+        if leased_ip != null { related_ips = push(related_ips, string!(leased_ip)) }
+        if inform_source_ip != null { related_ips = push(related_ips, string!(inform_source_ip)) }
+        if relay_ip != null { related_ips = push(related_ips, string!(relay_ip)) }
+        if server_id_ip != null { related_ips = push(related_ips, string!(server_id_ip)) }
+        if length(related_ips) > 0 { .related.ip = related_ips }
+
+        # ── Infoblox / dhcpd vendor-namespace fields ──
+        # ECS has no dhcp.* slots, so these live under the vendor prefix
+        # to stay queryable without polluting the ECS root.
+        if iface != null { .infoblox_nios.dhcp.interface = iface }
+        if relay_ip != null { .infoblox_nios.dhcp.relay_ip = relay_ip }
+        if lease_duration_str != null {
+          .infoblox_nios.dhcp.lease_duration = to_int!(string!(lease_duration_str))
+        }
+        if offered_duration_str != null {
+          .infoblox_nios.dhcp.offered_duration = to_int!(string!(offered_duration_str))
+        }
+        if transaction_id != null { .infoblox_nios.dhcp.transaction_id = transaction_id }
+        if server_id_ip != null { .infoblox_nios.dhcp.server_id_ip = server_id_ip }
+        if client_uid != null { .infoblox_nios.dhcp.client_uid = client_uid }
+        if lease_state != null { .infoblox_nios.dhcp.lease_state = lease_state }
+        if client_hostname != null { .infoblox_nios.dhcp.client_hostname = client_hostname }
+        if circuit_id != null { .infoblox_nios.dhcp.circuit_id = circuit_id }
+        if remote_id != null { .infoblox_nios.dhcp.remote_id = remote_id }
+        if option82_kind != null { .infoblox_nios.dhcp.option82_packet_kind = option82_kind }
+        if lease_found != null { .infoblox_nios.dhcp.lease_found = lease_found }
+        if dhcp_status_text != null {
+          .infoblox_nios.dhcp.status_text = dhcp_status_text
+        }
+        # ── Option 82 relay-agent slot routing (iter-7) ──
+        # Some Infoblox firmwares emit an interface name (e.g. "eth2") in
+        # the relay-agent slot rather than a dotted-quad relay IP. Surface
+        # both flavours under .option82.* so SOC keeps each kind queryable.
+        if action_token == "dhcp-option82" {
+          if relay_ip != null { .infoblox_nios.dhcp.option82.relay_ip = relay_ip }
+          if iface != null { .infoblox_nios.dhcp.option82.relay_iface = iface }
+        }
+
+        # ── ECS event categorization ──
+        # DHCP lease handshake is a network event. event.type uses
+        # ECS-allowed values: "info" + "connection" for ACK / REQUEST,
+        # plus "start" for ACK (the lease begins), "protocol" for
+        # Option 82 (a protocol-level annotation).
+        .event.kind     = "event"
+        .event.category = ["network"]
+        .event.action   = action_token
+        if action_token == "dhcp-ack" {
+          # ACK ends the handshake — the lease is now in effect.
+          .event.type = ["info", "connection", "start"]
+          .event.outcome = "success"
+        } else if action_token == "dhcp-offer" {
+          # OFFER is the server's reply to DISCOVER; lease not yet bound.
+          .event.type = ["info", "connection"]
+          .event.outcome = "success"
+        } else if action_token == "dhcp-discover" {
+          # DISCOVER is the client opening the handshake; no lease yet.
+          .event.type = ["info", "start"]
+          .event.outcome = "unknown"
+        } else if action_token == "dhcp-nak" || action_token == "dhcp-decline" {
+          # Negative acks / client-declined offers — failed handshake.
+          .event.type = ["info", "connection", "denied"]
+          .event.outcome = "failure"
+        } else if action_token == "dhcp-release" || action_token == "dhcp-expire" {
+          # Lease teardown — the binding ends. Truncated DHCPEXPIRE
+          # (iter-8) lands here too via the short-form branch; the
+          # `_truncated` tag is set during parsing. Outcome flips to
+          # "unknown" in the truncated case because the rest of the
+          # tokens (state, MAC) never arrived.
+          .event.type = ["info", "connection", "end"]
+          if includes(array(.tags) ?? [], "_truncated") {
+            .event.outcome = "unknown"
+          } else {
+            .event.outcome = "success"
+          }
+        } else if action_token == "dhcp-abandon" {
+          # ── lease abandonment (iter-8) ──
+          # The server retired an IP from the pool because a probe / a
+          # DHCPDECLINE proved the address is in use elsewhere. No client
+          # MAC in this shape — it's a server-internal pool decision; the
+          # matching DHCPDECLINE arrives just before. host-category since
+          # there's no network-counterparty in the message itself.
+          .event.category = ["host"]
+          .event.type = ["info", "end"]
+          .event.outcome = "failure"
+        } else if action_token == "dhcp-free" {
+          # Pool free-list cleanup — the binding has ended on the server.
+          .event.type = ["info", "end"]
+          .event.outcome = "success"
+        } else if action_token == "dhcp-request" {
+          # Iter-7: a trailing "wrong network." (or similar) status text marks
+          # the request as failed even though the server still emitted the
+          # DHCPREQUEST log line. Use status_text presence as the failure
+          # signal; bare requests without it stay outcome=unknown until the
+          # subsequent ACK/NAK arrives.
+          if dhcp_status_text != null {
+            .event.type = ["info", "connection", "denied"]
+            .event.outcome = "failure"
+          } else {
+            .event.type = ["info", "connection"]
+            .event.outcome = "unknown"
+          }
+        } else if action_token == "dhcp-inform" {
+          # Bound client requesting non-address config (DNS/NTP/...).
+          .event.type = ["info", "connection"]
+          .event.outcome = "unknown"
+        } else {
+          # Option 82
+          .event.type = ["info", "protocol"]
+          .event.outcome = "unknown"
+        }
+      }
+
+      # ── @timestamp ──
+      # The dhcpd payload has no sub-second timestamp (unlike BIND's
+      # responses channel); the syslog envelope @timestamp (already set
+      # on the event by upstream adapt_syslog) is the best precision
+      # available.
+
+      # ── cleanup ──
+      # The raw .message is now redundant (event.original holds the
+      # syslog line, parsed fields hold the structured view).
+      del(.message)
+  silent_drop_audit:
+    type: remap
+    inputs:
+      - "adapt_syslog.dropped"
+      - "remap_dhcp.dropped"
+      - "remap_dns_queries.dropped"
+      - "remap_dns_responses.dropped"
+      - "tag_unrouted.dropped"
+    drop_on_abort: true
+    source: |
+      reason = ""
+      meta_reason = .metadata.dropped.message
+      if meta_reason != null {
+        reason = string(meta_reason) ?? ""
+      }
+      # Authorized noise drops use abort with "noise:" prefix; drop them
+      # silently — they have no value, that's why they're tagged noise.
+      if starts_with(reason, "noise:") {
+        abort
+      }
+      # Everything else is an unexpected error path: surface to stdout.
+      .event.kind = "pipeline_error"
+      .event.category = ["host"]
+      .event.type = ["info", "error"]
+      .event.outcome = "failure"
+      .error = { "type": "vrl_abort", "message": reason }
+      .tags = push(array(.tags) ?? [], "_silent_error")
+      .event.original = string(.message) ?? string(.event.original) ?? ""
+sinks:
+  # ── normal output ──
+  # All successfully-parsed events land here as ECS-shaped JSON. Replace
+  # this console sink with your real destination (Kafka, Elasticsearch,
+  # OpenSearch, etc.) — see README.md "Customization".
+  stdout_out:
+    type: console
+    inputs:
+      - remap_dns_responses
+      - remap_dns_queries
+      - remap_dhcp
+      - tag_unrouted
+    target: stdout
+    encoding:
+      codec: json
+
+  # ── pipeline-error output ──
+  # silent_drop_audit converts every non-noise abort into an
+  # ECS-conformant pipeline_error event. We send those to stderr so
+  # you can spot parser-coverage gaps without polluting the main
+  # output stream — split the destinations in production.
+  stderr_errors:
+    type: console
+    inputs:
+      - silent_drop_audit
+    target: stderr
+    encoding:
+      codec: json
