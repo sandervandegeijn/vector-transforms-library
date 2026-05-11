@@ -958,10 +958,15 @@ transforms:
         # DECLINE) decides the eventual result. Distinct from the long-form
         # "DHCP<verb> on <ip> to <mac>" branch above because there is no
         # "on <ip>" token to anchor on.
+        # Trailing diagnostic text (e.g. ": unknown network segment") mirrors
+        # the DHCPREQUEST status_text slot: when the server can't honour the
+        # discovery (no pool serving the relay subnet), Infoblox appends a
+        # colon-prefixed reason. The `via` slot is constrained to non-colon
+        # chars so the colon delimits the optional status without ambiguity.
         action_token = "dhcp-discover"
         dhcpdiscover, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPDISCOVER from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+          r'^DHCPDISCOVER from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>[^\s:]+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s*:\s*(?P<status_text>.+?))?$'
         )
         if parse_err == null {
           client_mac_raw = string!(dhcpdiscover.mac)
@@ -974,6 +979,9 @@ transforms:
           }
           if dhcpdiscover.transid != null { transaction_id = string!(dhcpdiscover.transid) }
           if dhcpdiscover.uid != null { client_uid = string!(dhcpdiscover.uid) }
+          if dhcpdiscover.status_text != null {
+            dhcp_status_text = strip_whitespace(string!(dhcpdiscover.status_text))
+          }
         }
       } else if starts_with(dhcpd_message, "DHCPINFORM ") {
         # ── DHCPINFORM: bound client requesting additional config ──
@@ -1554,8 +1562,17 @@ transforms:
           .event.outcome = "success"
         } else if action_token == "dhcp-discover" {
           # DISCOVER is the client opening the handshake; no lease yet.
-          .event.type = ["info", "start"]
-          .event.outcome = "unknown"
+          # If the server appended a colon-prefixed status ("unknown network
+          # segment" etc), the server already refused the discovery — flip
+          # to failure so SOC isn't waiting for a downstream NAK that never
+          # arrives.
+          if dhcp_status_text != null {
+            .event.type = ["info", "connection", "denied"]
+            .event.outcome = "failure"
+          } else {
+            .event.type = ["info", "start"]
+            .event.outcome = "unknown"
+          }
         } else if action_token == "dhcp-nak" || action_token == "dhcp-decline" {
           # Negative acks / client-declined offers — failed handshake.
           .event.type = ["info", "connection", "denied"]
