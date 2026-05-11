@@ -144,6 +144,19 @@ transforms:
         abort "noise:syslog-mark"
       }
 
+      # ── drop validate_dhcpd banner noise (iter-10) ──
+      # Infoblox's `restart_dhcpd` wrapper invokes `dhcpd -t` under the
+      # process name `validate_dhcpd` to validate the config before each
+      # restart. Every line it emits is structural startup output —
+      # program banner ("Internet Systems Consortium DHCP Server 4.3.3-P1"),
+      # copyright, config/database/PID paths, "DHCP/DDNS stats are not
+      # cleared" — none of which carries a lease, client, or DNS event.
+      # The matching dhcpd process (immediately after the validator
+      # succeeds) carries any operational signal. Authorized for drop.
+      if proc_name == "validate_dhcpd" {
+        abort "noise:validate-dhcpd-banner"
+      }
+
       .event.kind = "pipeline_error"
       .event.category = ["host"]
       .event.type = ["info"]
@@ -710,6 +723,16 @@ transforms:
       if dhcpd_message == "Lease publishing disabled" {
         abort "noise:lease-publishing-disabled"
       }
+      # ── preflight: drop deferred-DNS-update batch summary (iter-10) ──
+      # ISC dhcpd / Infoblox emits a periodic batch-completion stats line
+      # whenever the deferred-DDNS queue is drained:
+      #   "Processed <n> deferred DNS updates: <a> successes, <b> deferred
+      #    again, <c> abandoned (<u> unexpired, <d> disabled, not processed)"
+      # Carries no client/IP context — pure aggregate counters covered by
+      # Vector / k8s metrics. Authorized for drop.
+      if starts_with(dhcpd_message, "Processed ") && contains(dhcpd_message, " deferred DNS updates:") {
+        abort "noise:dhcpd-deferred-dns-stats"
+      }
 
       # ── preflight: drop DDNS internal cleanup diagnostics (iter-8) ──
       # ISC dhcpd emits this trace line whenever the DDNS update state
@@ -1022,28 +1045,54 @@ transforms:
         if starts_with(dhcpd_message, "Added new forward map ") {
           action_token = "ddns-add-forward"
           ddns_direction = "forward"
+          # The `by server <server>` slot is either the structured
+          # `<ip>#<port>` form or the literal `<unknown address, family 0>`
+          # token (no `#`). Capture verbatim; downstream parses the
+          # structured form into server_ip/port and routes the unresolved
+          # form into ddns_failure_server (mirrors the Unable-to-add
+          # branches below).
           ddns_forward, parse_err = parse_regex(
             dhcpd_message,
-            r'^Added new forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server (?P<server_ip>\S+)#(?P<server_port>\d+)$'
+            r'^Added new forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server\s+(?P<server>.+?)$'
           )
           if parse_err == null {
             ddns_fqdn = string!(ddns_forward.fqdn)
             ddns_target_ip = string!(ddns_forward.target_ip)
-            ddns_server_ip = string!(ddns_forward.server_ip)
-            ddns_server_port = string!(ddns_forward.server_port)
+            server_token = strip_whitespace(string!(ddns_forward.server))
+            server_match, _smerr = parse_regex(
+              server_token,
+              r'^(?P<server_ip>\d+\.\d+\.\d+\.\d+)#(?P<server_port>\d+)$'
+            )
+            if _smerr == null {
+              ddns_server_ip = string!(server_match.server_ip)
+              ddns_server_port = string!(server_match.server_port)
+            } else {
+              ddns_failure_server = server_token
+            }
           }
         } else if starts_with(dhcpd_message, "Added reverse map ") {
           action_token = "ddns-add-reverse"
           ddns_direction = "reverse"
+          # Server slot may be `<ip>#<port>` or `<unknown address, family 0>`.
+          # Same dual-shape handling as the forward branch above.
           ddns_reverse, parse_err = parse_regex(
             dhcpd_message,
-            r'^Added reverse map from (?P<ptr_name>\S+?)\.?\s+to\s+(?P<fqdn>.+?) by server (?P<server_ip>\S+)#(?P<server_port>\d+)$'
+            r'^Added reverse map from (?P<ptr_name>\S+?)\.?\s+to\s+(?P<fqdn>.+?) by server\s+(?P<server>.+?)$'
           )
           if parse_err == null {
             ddns_ptr_name = string!(ddns_reverse.ptr_name)
             ddns_fqdn = string!(ddns_reverse.fqdn)
-            ddns_server_ip = string!(ddns_reverse.server_ip)
-            ddns_server_port = string!(ddns_reverse.server_port)
+            server_token = strip_whitespace(string!(ddns_reverse.server))
+            server_match, _smerr = parse_regex(
+              server_token,
+              r'^(?P<server_ip>\d+\.\d+\.\d+\.\d+)#(?P<server_port>\d+)$'
+            )
+            if _smerr == null {
+              ddns_server_ip = string!(server_match.server_ip)
+              ddns_server_port = string!(server_match.server_port)
+            } else {
+              ddns_failure_server = server_token
+            }
           }
         } else {
           parse_err = "unrecognised Added-prefixed dhcpd message"
@@ -1077,12 +1126,32 @@ transforms:
         } else if starts_with(dhcpd_message, "Removed reverse map on ") {
           action_token = "ddns-remove-reverse"
           ddns_direction = "reverse"
+          # Two production shapes share this prefix:
+          #   "Removed reverse map on <ptr-name>."
+          #   "Removed reverse map on <ptr-name>. by server <ip>#<port>"
+          # The trailing server tuple appeared on appliances with a
+          # populated DDNS upstream; older firmwares emit the bare form.
+          # Make the `by server` segment optional and parse the structured
+          # tuple when present so SOC can correlate the DDNS push.
           ddns_remove_reverse, parse_err = parse_regex(
             dhcpd_message,
-            r'^Removed reverse map on (?P<ptr_name>\S+?)\.?$'
+            r'^Removed reverse map on (?P<ptr_name>\S+?)\.?(?:\s+by server\s+(?P<server>.+?))?$'
           )
           if parse_err == null {
             ddns_ptr_name = string!(ddns_remove_reverse.ptr_name)
+            if ddns_remove_reverse.server != null {
+              server_token = strip_whitespace(string!(ddns_remove_reverse.server))
+              server_match, _smerr = parse_regex(
+                server_token,
+                r'^(?P<server_ip>\d+\.\d+\.\d+\.\d+)#(?P<server_port>\d+)$'
+              )
+              if _smerr == null {
+                ddns_server_ip = string!(server_match.server_ip)
+                ddns_server_port = string!(server_match.server_port)
+              } else {
+                ddns_failure_server = server_token
+              }
+            }
           }
         } else {
           parse_err = "unrecognised Removed-prefixed dhcpd message"
