@@ -755,6 +755,38 @@ transforms:
         abort "noise:dhcpd-uid-duplicate"
       }
 
+      # ── preflight: drop dhcpd startup-banner / stats noise ──
+      # When Infoblox restarts dhcpd, the real `dhcpd` process (not just the
+      # `validate_dhcpd` config-validator already dropped in tag_unrouted)
+      # emits the ISC startup banner block plus operational-stats lines and
+      # interface bindings. None carry client/lease signal or state-transition
+      # info — covered by k8s pod-lifecycle / Vector metrics. Authorized for
+      # drop in docs/infoblox-authorized-drops.md under noise:dhcpd-banner.
+      # NOTE: process-lifecycle state changes ("Server starting service.",
+      # "Exiting", "Deferred DNS updates thread shutting down", "Retrying DNS
+      # updates") are NOT dropped — they're emitted as proper events by the
+      # `dhcpd-lifecycle` branch below so SOC can detect unexpected restarts
+      # and DDNS health drift.
+      is_dhcpd_banner =
+        starts_with(dhcpd_message, "Internet Systems Consortium DHCP Server ") ||
+        starts_with(dhcpd_message, "Copyright ") && contains(dhcpd_message, "Internet Systems Consortium") ||
+        dhcpd_message == "All rights reserved." ||
+        dhcpd_message == "For info, please visit https://www.isc.org/software/dhcp/" ||
+        dhcpd_message == "All NAC filters turned on." ||
+        starts_with(dhcpd_message, "Config file: ") ||
+        starts_with(dhcpd_message, "Database file: ") ||
+        starts_with(dhcpd_message, "PID file: ") ||
+        dhcpd_message == "DHCP/DDNS stats are cleared" ||
+        dhcpd_message == "DHCP/DDNS stats are not cleared" ||
+        match(dhcpd_message, r'^\d+ leases accepted from database$') ||
+        match(dhcpd_message, r'^Wrote \d+ leases to database, \d+ to leases file\.$') ||
+        starts_with(dhcpd_message, "LPF receive buffer size ") ||
+        starts_with(dhcpd_message, "Listening on ") ||
+        starts_with(dhcpd_message, "Sending on ")
+      if is_dhcpd_banner {
+        abort "noise:dhcpd-banner"
+      }
+
       # default state in case nothing matches
       parse_err = null
       action_token = ""
@@ -784,6 +816,7 @@ transforms:
       dhcp_status_text = null
       ddns_reason = null
       ddns_failure_server = null
+      lifecycle_state = null
 
       # ── dhcpd warning preflight ──
       # ISC dhcpd / Infoblox emit a handful of internal warnings on the
@@ -990,10 +1023,16 @@ transforms:
         # No "to <mac>" or "(<hostname>)" token — only source IP, via, TransID.
         # SIEM-relevant: ties an IP-in-use to a transaction, surfaces hosts
         # whose addresses didn't come from this DHCP server's lease pool.
+        # Trailing diagnostic text (e.g. ": unknown subnet for client address
+        # <ip>") mirrors the DHCPDISCOVER status_text slot: when the server
+        # can't honour the inform (no configured subnet covers the source IP),
+        # Infoblox appends a colon-prefixed reason. The `via` slot is
+        # constrained to non-colon chars so the colon delimits the optional
+        # status without ambiguity.
         action_token = "dhcp-inform"
         dhcpinform, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPINFORM from (?P<src_ip>\S+)\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+          r'^DHCPINFORM from (?P<src_ip>\S+)\s+via\s+(?P<via>[^\s:]+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s*:\s*(?P<status_text>.+?))?$'
         )
         if parse_err == null {
           inform_source_ip = string!(dhcpinform.src_ip)
@@ -1005,6 +1044,9 @@ transforms:
           }
           if dhcpinform.transid != null { transaction_id = string!(dhcpinform.transid) }
           if dhcpinform.uid != null { client_uid = string!(dhcpinform.uid) }
+          if dhcpinform.status_text != null {
+            dhcp_status_text = strip_whitespace(string!(dhcpinform.status_text))
+          }
         }
       } else if starts_with(dhcpd_message, "Option 82:") {
         # ── Option 82: relay-agent annotation seen on incoming DHCP packet ──
@@ -1365,6 +1407,26 @@ transforms:
           if free_assoc.uid != null { client_uid = string!(free_assoc.uid) }
           client_mac_raw = string!(free_assoc.hw)
         }
+      } else if dhcpd_message == "Server starting service." ||
+                dhcpd_message == "Exiting" ||
+                dhcpd_message == "Deferred DNS updates thread shutting down" ||
+                dhcpd_message == "Retrying DNS updates" {
+        # ── dhcpd process lifecycle state change ──
+        # Genuine state transitions on the dhcpd daemon — start, stop, the
+        # deferred-DDNS worker thread shutting down on shutdown, or a DDNS
+        # retry tick. No client/lease data, but a SOC consumer wants these
+        # to detect unexpected restarts (crash, OOM) and DDNS health drift
+        # (repeated retries imply BIND/DDNS endpoint is wedged). Not noise.
+        action_token = "dhcpd-lifecycle"
+        if dhcpd_message == "Server starting service." {
+          lifecycle_state = "start"
+        } else if dhcpd_message == "Exiting" {
+          lifecycle_state = "stop"
+        } else if dhcpd_message == "Deferred DNS updates thread shutting down" {
+          lifecycle_state = "ddns-thread-stop"
+        } else {
+          lifecycle_state = "ddns-retry"
+        }
       } else {
         # ── unknown sub-shape ──
         # Force the fallback path below; fabricate an err to flow through.
@@ -1392,6 +1454,19 @@ transforms:
         .event.type     = ["info"]
         .event.action   = action_token
         .event.outcome  = "failure"
+      } else if action_token == "dhcpd-lifecycle" {
+        # ── dhcpd process lifecycle event ──
+        # Process state transition (start / stop / ddns-thread-stop /
+        # ddns-retry). No client context — emit as host-category info event;
+        # SOC pivots on event.action=dhcpd-lifecycle and the lifecycle_state
+        # discriminator under the vendor namespace. outcome=unknown because
+        # the line alone doesn't say whether the transition was clean.
+        .infoblox_nios.dhcp.lifecycle_state = lifecycle_state
+        .event.kind     = "event"
+        .event.category = ["host"]
+        .event.type     = ["info"]
+        .event.action   = action_token
+        .event.outcome  = "unknown"
       } else if ddns_direction != null {
         # ── DDNS map update event ──
         # Forward (A) or reverse (PTR) push from dhcpd to its configured
