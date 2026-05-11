@@ -1300,6 +1300,41 @@ transforms:
             dhcp_status_text = strip_whitespace(string!(decline.status_text))
           }
         }
+      } else if starts_with(dhcpd_message, "Reclaiming ") || starts_with(dhcpd_message, "NOT FREE/BACKUP lease ") {
+        # ── abandoned-lease lifecycle ──
+        # ISC dhcpd / Infoblox emit three closely-related shapes when an
+        # IP marked `abandoned` cycles back into the pool. They typically
+        # arrive within a second of each other for the same IP; SOC pivots
+        # on the IP for pool-exhaustion / probe-pattern hunting.
+        #
+        # Sub-shapes (one alternation regex; `phase` distinguishes them):
+        #   sweep:          "Reclaiming abandoned lease <ip>."
+        #   requested:      "Reclaiming REQUESTed abandoned IP address <ip>."
+        #   state-warning:  "NOT FREE/BACKUP lease <ip>  End Time <epoch>
+        #                    Bind-State <state> Next-Bind-State <state>"
+        # All three carry the leased IP. The state-warning variant also
+        # carries the bind-state transition (typically abandoned → free);
+        # stash both states under the vendor namespace so they're queryable.
+        action_token = "dhcp-reclaim"
+        reclaim, parse_err = parse_regex(
+          dhcpd_message,
+          r'^(?:Reclaiming abandoned lease (?P<ip_sweep>\d+\.\d+\.\d+\.\d+)\.?|Reclaiming REQUESTed abandoned IP address (?P<ip_req>\d+\.\d+\.\d+\.\d+)\.?|NOT FREE/BACKUP lease (?P<ip_state>\d+\.\d+\.\d+\.\d+)\s+End Time (?P<end_time>\d+)\s+Bind-State (?P<bind_state>\S+)\s+Next-Bind-State (?P<next_bind_state>\S+))$'
+        )
+        if parse_err == null {
+          if reclaim.ip_sweep != null {
+            leased_ip = string!(reclaim.ip_sweep)
+            dhcp_status_text = "sweep"
+          } else if reclaim.ip_req != null {
+            leased_ip = string!(reclaim.ip_req)
+            dhcp_status_text = "requested"
+          } else {
+            leased_ip = string!(reclaim.ip_state)
+            dhcp_status_text = "state-warning"
+            .infoblox_nios.dhcp.bind_state = string!(reclaim.bind_state)
+            .infoblox_nios.dhcp.next_bind_state = string!(reclaim.next_bind_state)
+            .infoblox_nios.dhcp.lease_end_time = to_int!(string!(reclaim.end_time))
+          }
+        }
       } else if match(dhcpd_message, r'^\d+\.\d+\.\d+\.\d+:\s+removing client association ') {
         # ── lease-pool free-list housekeeping ──
         # ISC dhcpd's pool-cleanup path emits this when a lease binding
@@ -1549,6 +1584,15 @@ transforms:
           .event.outcome = "failure"
         } else if action_token == "dhcp-free" {
           # Pool free-list cleanup — the binding has ended on the server.
+          .event.type = ["info", "end"]
+          .event.outcome = "success"
+        } else if action_token == "dhcp-reclaim" {
+          # Server-side recovery: an `abandoned` IP returns to the FREE
+          # pool — either via the periodic sweep, because a client
+          # re-REQUESTed the address, or via the bind-state transition
+          # warning. No client counterparty in the message; host category
+          # with outcome=success captures the pool recovery.
+          .event.category = ["host"]
           .event.type = ["info", "end"]
           .event.outcome = "success"
         } else if action_token == "dhcp-request" {
