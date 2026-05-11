@@ -134,7 +134,7 @@ transforms:
     drop_on_abort: true
     reroute_dropped: true
     source: |
-      # ── drop syslogd heartbeat noise (iter-8) ──
+      # ── drop syslogd heartbeat noise ──
       # Syslog daemons emit a periodic "-- MARK --" heartbeat with
       # process.name="--" and message="MARK --". It carries no signal —
       # pure liveness ping. Authorized for drop.
@@ -144,7 +144,7 @@ transforms:
         abort "noise:syslog-mark"
       }
 
-      # ── drop validate_dhcpd banner noise (iter-10) ──
+      # ── drop validate_dhcpd banner noise ──
       # Infoblox's `restart_dhcpd` wrapper invokes `dhcpd -t` under the
       # process name `validate_dhcpd` to validate the config before each
       # restart. Every line it emits is structural startup output —
@@ -222,7 +222,7 @@ transforms:
         r'^infoblox-responses:\s+(?P<ts>\S+\s\S+)\s+client\s+(?P<client_ip>\S+)#(?P<client_port>\d+):\s+(?:view\s+(?P<view>\S+):\s+)?(?P<transport>\S+):\s+query:\s+(?P<qname>\S+)\s+(?P<qclass>[A-Z][A-Z0-9]+)\s+(?P<qtype>\S+)\s+response:\s+(?P<rcode>\S+)\s+(?P<flags>\S+)(?:\s+(?P<answers>.*))?$'
       )
 
-      # ── unknown-question variant (iter-6) ──
+      # ── unknown-question variant ──
       # When BIND can decode the response code but the inbound question
       # bytes were too garbled to extract qname/class/type, the payload
       # carries the literal `<unknown due to query error>` token in place
@@ -253,7 +253,7 @@ transforms:
         .tags = push(array(.tags) ?? [], "_parse_failure")
         .error = { "type": "parse_failure", "message": parse_err }
       } else if unknown_question {
-        # ── unknown-question response (iter-6) ──
+        # ── unknown-question response ──
         # Emit response_code, transport, client, flags; skip dns.question.*.
         response_code      = string!(bind_payload.rcode)
         raw_flags          = string!(bind_payload.flags)
@@ -502,7 +502,7 @@ transforms:
       # the post-"query:" copy as authoritative because it's the field
       # BIND uses to drive matching/logging downstream.
       #
-      # Real-world variations that relax the iter-1 anchor:
+      # Real-world variations that relax the base anchor:
       #   * The "view <N>:" segment is absent on appliances without
       #     split-horizon views, and on version.bind / chaos-class probes.
       #     We make it an optional non-capturing group.
@@ -515,7 +515,7 @@ transforms:
       #     parens or octal escapes, e.g. `_dcimprovsrv._tcp.\(none\)`.
       #     The earlier `[^)]*` capture stopped at the first `\)` glyph;
       #     extend it to `(?:\\.|[^)])*` so escaped chars are absorbed
-      #     and only an *unescaped* `)` closes the group (iter-5).
+      #     and only an *unescaped* `)` closes the group.
       #   * Public-view queries from external recursive resolvers
       #     carry an EDNS Client Subnet annotation appended after the
       #     resolver-ip paren as "[ECS <subnet>/<scope1>/<scope2>]". This
@@ -671,10 +671,9 @@ transforms:
       #
       # Sub-shapes handled (verbs covered: ACK, OFFER, NAK, DECLINE,
       # EXPIRE, RELEASE share the long form; REQUEST, Option 82, and
-      # the bare ACK short form have their own branches; iter-4 adds
-      # bare DHCPDISCOVER, DDNS forward/reverse map updates, and the
-      # lease-pool free-list housekeeping line; iter-6 adds DDNS
-      # forward/reverse map *removals* and a bare DHCPEXPIRE shape):
+      # the bare ACK short form, DHCPDISCOVER, DDNS forward/reverse map
+      # add/remove, the lease-pool free-list housekeeping line, and a
+      # bare DHCPEXPIRE shape each have their own branch):
       #   1. DHCP<VERB> on <ip> to <mac> [(<hostname>)] via <iface>
       #      [relay <relay>] [lease-duration <secs>]
       #      [offered-duration <secs>] [(<state>)] [uid <uid>]
@@ -694,7 +693,7 @@ transforms:
       # trailing \n on .message.
       dhcpd_message = strip_whitespace(string!(.message))
 
-      # ── preflight: drop "Lease state active. Not abandoning <ip>" noise (iter-7) ──
+      # ── preflight: drop "Lease state active. Not abandoning <ip>" noise ──
       # ISC dhcpd / Infoblox emits this diagnostic line on every release/expire
       # path where the lease was still marked active in the binding state — it
       # always pairs with a richer DHCPRELEASE/DHCPEXPIRE event a fraction of a
@@ -705,7 +704,7 @@ transforms:
         abort "noise:lease-state-active"
       }
 
-      # ── preflight: drop dhcpd self-stats noise (iter-8) ──
+      # ── preflight: drop dhcpd self-stats noise ──
       # dhcpd emits two periodic operational-stats lines that have no SIEM
       # signal — already covered by Vector / k8s metrics and would otherwise
       # generate one event per minute per appliance:
@@ -723,7 +722,7 @@ transforms:
       if dhcpd_message == "Lease publishing disabled" {
         abort "noise:lease-publishing-disabled"
       }
-      # ── preflight: drop deferred-DNS-update batch summary (iter-10) ──
+      # ── preflight: drop deferred-DNS-update batch summary ──
       # ISC dhcpd / Infoblox emits a periodic batch-completion stats line
       # whenever the deferred-DDNS queue is drained:
       #   "Processed <n> deferred DNS updates: <a> successes, <b> deferred
@@ -734,7 +733,7 @@ transforms:
         abort "noise:dhcpd-deferred-dns-stats"
       }
 
-      # ── preflight: drop DDNS internal cleanup diagnostics (iter-8) ──
+      # ── preflight: drop DDNS internal cleanup diagnostics ──
       # ISC dhcpd emits this trace line whenever the DDNS update state
       # machine cancels a pending lease pointer. The cb=<hex> is an
       # internal callback address used by the developers; no SIEM signal,
@@ -804,7 +803,7 @@ transforms:
         action_token = "dhcpd-warning"
         warning_text = dhcpd_message
       } else if match(dhcpd_message, r'^DHCPEXPIRE on \S+ to\s*$') {
-        # ── truncated DHCPEXPIRE (iter-8) ──
+        # ── truncated DHCPEXPIRE ──
         # Production has surfaced a truncated form that ends right after
         # `to ` — the MAC and remaining lease tokens were lost in transit
         # (likely a syslog-relay buffer cut). The leased IP is intact,
@@ -829,7 +828,7 @@ transforms:
         # downstream categorization decide outcome / type. OFFER carries
         # an extra "offered-duration" token; ACK on RENEW carries a
         # "(RENEW)" state and "uid <hex>" — both optional in the regex.
-        # Trailing-slot relaxation (iter-6): dhcpd's lease-database
+        # Trailing-slot relaxation: dhcpd's lease-database
         # housekeeping path emits a bare `DHCPEXPIRE on <ip> to <mac>`
         # with no via/relay/lease-duration tokens. Make the entire
         # `via <iface>` segment optional so the same regex covers both
@@ -939,7 +938,7 @@ transforms:
           if dhcpreq.transid != null { transaction_id = string!(dhcpreq.transid) }
           if dhcpreq.uid != null { client_uid = string!(dhcpreq.uid) }
           if dhcpreq.state != null { lease_state = string!(dhcpreq.state) }
-          # ── trailing diagnostic text (iter-7) ──
+          # ── trailing diagnostic text ──
           # Some Infoblox firmwares append a colon-prefixed reason after a
           # DHCPREQUEST when the server can't honour it (e.g. "wrong network.",
           # "lease unavailable."). Capture verbatim under the vendor namespace
@@ -1157,7 +1156,7 @@ transforms:
           parse_err = "unrecognised Removed-prefixed dhcpd message"
         }
       } else if starts_with(dhcpd_message, "Reverse map update for ") {
-        # ── DDNS reverse-map update abandoned (iter-7) ──
+        # ── DDNS reverse-map update abandoned ──
         # ISC dhcpd emits this when the periodic background retry loop on a
         # PTR (reverse) update gives up: the DNS server returned a
         # non-retryable rcode (NXRRSET / REFUSED / FORMERR / etc.). Carries
@@ -1176,8 +1175,8 @@ transforms:
           ddns_reason = strip_whitespace(string!(rev_abandon.reason))
         }
       } else if starts_with(dhcpd_message, "Unable to add forward map ") {
-        # ── DDNS forward-map add failure (iter-8) ──
-        # Counterpart of the iter-7 reverse-add-failure branch and of
+        # ── DDNS forward-map add failure ──
+        # Counterpart of the reverse-add-failure branch below and of
         # "Added new forward map …": dhcpd tried to push an A record into
         # BIND, the upstream rejected it. Format:
         #   Unable to add forward map from <fqdn> to <ip> by server <ip>#<port>: <reason>
@@ -1214,7 +1213,7 @@ transforms:
           }
         }
       } else if starts_with(dhcpd_message, "Unable to add reverse map ") {
-        # ── DDNS reverse-map add failure (iter-7) ──
+        # ── DDNS reverse-map add failure ──
         # Counterpart of "Added reverse map …": dhcpd tried to push a PTR
         # into BIND, the upstream rejected it (timeout / SERVFAIL / unknown
         # address / …). Format:
@@ -1253,7 +1252,7 @@ transforms:
           }
         }
       } else if starts_with(dhcpd_message, "Abandoning IP address ") {
-        # ── lease abandonment (iter-8) ──
+        # ── lease abandonment ──
         # ISC dhcpd marks an address as abandoned when a client refuses an
         # offer (DHCPDECLINE) or a probe finds it already in use. The
         # server keeps the binding out of the pool until the abandonment
@@ -1272,7 +1271,7 @@ transforms:
           dhcp_status_text = strip_whitespace(string!(abandon.reason))
         }
       } else if match(dhcpd_message, r'^DHCPDECLINE of \S+ from ') {
-        # ── DHCPDECLINE of/from (iter-8) ──
+        # ── DHCPDECLINE of/from ──
         # Distinct from the long-form "DHCPDECLINE on <ip> to <mac>" handled
         # by the long-verb branch above: this shape uses "of <ip> from <mac>"
         # like DHCPRELEASE-of/from, plus a trailing ": abandoned" status.
@@ -1391,7 +1390,7 @@ transforms:
         if ddns_server_port != null {
           .infoblox_nios.dhcp.ddns.server_port = to_int!(string!(ddns_server_port))
         }
-        # ── DDNS failure context (iter-7) ──
+        # ── DDNS failure context ──
         # The "Reverse map update for <ip> abandoned because of non-retryable
         # failure: <reason>" and "Unable to add reverse map ... : <reason> by
         # server <unresolved>" branches surface a textual reason; record it
@@ -1422,7 +1421,7 @@ transforms:
         .event.category = ["network"]
         .event.type     = ["info", "change"]
         .event.action   = action_token
-        # Add/Remove forward & reverse succeed; the iter-7 abandonment and
+        # Add/Remove forward & reverse succeed; the abandonment and
         # add-failure branches are failures — the reason is stashed above.
         if action_token == "ddns-reverse-abandoned" ||
            action_token == "ddns-add-failed-reverse" ||
@@ -1493,7 +1492,7 @@ transforms:
         if dhcp_status_text != null {
           .infoblox_nios.dhcp.status_text = dhcp_status_text
         }
-        # ── Option 82 relay-agent slot routing (iter-7) ──
+        # ── Option 82 relay-agent slot routing ──
         # Some Infoblox firmwares emit an interface name (e.g. "eth2") in
         # the relay-agent slot rather than a dotted-quad relay IP. Surface
         # both flavours under .option82.* so SOC keeps each kind queryable.
@@ -1528,7 +1527,7 @@ transforms:
           .event.outcome = "failure"
         } else if action_token == "dhcp-release" || action_token == "dhcp-expire" {
           # Lease teardown — the binding ends. Truncated DHCPEXPIRE
-          # (iter-8) lands here too via the short-form branch; the
+          # lands here too via the short-form branch; the
           # `_truncated` tag is set during parsing. Outcome flips to
           # "unknown" in the truncated case because the rest of the
           # tokens (state, MAC) never arrived.
@@ -1539,7 +1538,7 @@ transforms:
             .event.outcome = "success"
           }
         } else if action_token == "dhcp-abandon" {
-          # ── lease abandonment (iter-8) ──
+          # ── lease abandonment ──
           # The server retired an IP from the pool because a probe / a
           # DHCPDECLINE proved the address is in use elsewhere. No client
           # MAC in this shape — it's a server-internal pool decision; the
