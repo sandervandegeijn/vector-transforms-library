@@ -1,0 +1,1188 @@
+data_dir: /var/lib/vector
+
+# ── Kubernetes API-server audit log — Vector → ECS example pipeline ──
+# Maps Kubernetes audit events (audit.k8s.io/v1) to the Elastic Common Schema.
+# Audit payloads are routed into five partitions by stage / level / objectRef
+# presence:
+# • request_response_complete   (ResponseComplete + objectRef + level=Request)
+# • metadata_response_complete  (ResponseComplete + objectRef + level=Metadata)
+# • non_resource                (ResponseComplete, no objectRef — /healthz etc.)
+# • response_started            (ResponseStarted)
+# • panic                       (Panic stage)
+# Anything that doesn't match a known shape stays in route_partitions._unmatched
+# and surfaces as a tagged pipeline_error via silent_drop_audit rather than
+# being silently dropped (see "Error contract" in README.md).
+# The example reads the kube-apiserver audit log directly from a file. To wire
+# the typical Filebeat-shipped HTTP shape instead, swap the `kube_audit` source
+# for an `http_server` source and remove `parse_audit_line` — see README.md.
+# No enrichment is wired in this example — the pipeline is a pure parser /
+# ECS normaliser. README.md documents how to add user/department lookup (a
+# `memory` enrichment table) and GeoIP (MaxMind via `geoip` enrichment table)
+# when you need them.
+
+sources:
+  # ── kube-apiserver audit log (file) ──
+  # Default kubeadm/kops/k3s control planes write the audit log under one of:
+  # /var/log/kubernetes/audit/audit.log
+  # /var/log/kube-apiserver-audit.log
+  # Adjust `include` to match your distribution.
+  kube_audit:
+    type: file
+    include:
+      - /var/log/kubernetes/audit/audit.log
+    read_from: beginning
+
+transforms:
+  # ── parse audit line into the root document ──
+  # The file source delivers each line as `.message`. The audit ND-JSON one
+  # event per line; parse it and replace `.` with the parsed object so the
+  # downstream envelope_remap / route_partitions / remap_* logic (which
+  # assumes audit fields are at root, as a Filebeat HTTP shipper would
+  # deliver them) sees the expected shape.
+  parse_audit_line:
+    type: remap
+    inputs:
+      - kube_audit
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      raw = string!(.message)
+      parsed = parse_json!(raw)
+      . = object!(parsed)
+  envelope_remap:
+    type: remap
+    inputs:
+      - parse_audit_line
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── (a) drop legacy TCP proxy probe ──
+      # Filebeat occasionally forwards a "reading PROXY protocol" line that the
+      # old Logstash pipeline used to eat. We abort early so it never enters
+      # the route or any per-partition remap.
+      if (string(.message) ?? "") == "reading PROXY protocol" {
+        abort "noise:proxy_probe"
+      }
+
+      # ── (b) strip Filebeat envelope residue ──
+      # Fields below are Filebeat-internal metadata. Keep agent.*, host.*,
+      # ecs.* — those are real ECS envelope data carried by the collector pod.
+      del(."@version")
+      del(.log)
+      del(.timestamp)
+      del(.path)
+      del(.sample_rate)
+      del(.source_type)
+      del(.tags)
+      del(.index)
+      del(.input)
+      del(.message)
+
+      # Filebeat appends two host.* leaves that have no ECS schema entry;
+      # drop them so Gate 4 sees only ECS-valid paths.
+      del(.host.containerized)
+      del(.host.os.codename)
+
+  # ── 3. route_partitions — split by audit stage / level / objectRef presence ──
+  # Discriminator VRL is taken verbatim from partitions.json.
+  # The _unmatched lane catches any shape not covered by the five real partitions
+  # and feeds silent_drop_audit so unknown events surface as pipeline_error
+  # rather than silently disappearing.
+  route_partitions:
+    type: route
+    inputs:
+      - envelope_remap
+    route:
+      panic:                    '.stage == "Panic"'
+      response_started:         '.stage == "ResponseStarted"'
+      non_resource:             '.stage == "ResponseComplete" && !exists(.objectRef)'
+      request_response_complete: '.stage == "ResponseComplete" && exists(.objectRef) && .level == "Request"'
+      metadata_response_complete: '.stage == "ResponseComplete" && exists(.objectRef) && .level == "Metadata"'
+
+  # ── 4a. remap_panic ──────────────────────────────────────────────────────────
+  # Panic-stage events (hard API-server crash) — rare; carries objectRef.
+  remap_panic:
+    type: remap
+    inputs:
+      - route_partitions.panic
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── snapshot raw audit payload for event.original ──
+      # Mirrors the Elastic ingest pipeline's first JSON-decode processor (json(event.original) → kubernetes.audit):
+      # keep a JSON-encoded copy of the as-received audit document BEFORE
+      # any mutation. We strip the Filebeat envelope keys from the snapshot
+      # so it reflects the wire-shape of the original audit event only.
+      raw_audit = .
+      del(raw_audit.agent)
+      del(raw_audit.host)
+      del(raw_audit."ecs")
+      del(raw_audit.input)
+      del(raw_audit.index)
+      del(raw_audit.path)
+      del(raw_audit.sample_rate)
+      del(raw_audit.source_type)
+      del(raw_audit.tags)
+      del(raw_audit."@version")
+      del(raw_audit.log)
+      del(raw_audit.timestamp)
+      del(raw_audit.message)
+      original_payload = encode_json(raw_audit)
+      .event = {}
+      .event.original = original_payload
+
+      # ── nest audit fields under kubernetes.audit (Elastic ingest pipeline shape) ──
+      # The the Elastic ingest pipeline's first JSON-decode processor produces kubernetes.audit.* by JSON-parsing
+      # event.original. We achieve the same shape by moving root-level audit
+      # fields into kubernetes.audit.* with del() so the originals don't leak.
+      # ── annotations: labels → annotations rename fallback ──
+      # The reference Elastic ingest pipeline renames .labels → .annotations when annotations is absent. Cheap
+      # exists() guards keep this a no-op when both / neither are present.
+      if !exists(.annotations) && exists(.labels) {
+        .annotations = del(.labels)
+      }
+
+      audit = {}
+      audit.apiVersion               = del(.apiVersion)
+      audit.auditID                  = del(.auditID)
+      audit.kind                     = del(.kind)
+      audit.level                    = del(.level)
+      audit.stage                    = del(.stage)
+      audit.verb                     = del(.verb)
+      audit.requestURI               = del(.requestURI)
+      audit.user                     = del(.user)
+      audit.sourceIPs                = del(.sourceIPs)
+      audit.userAgent                = del(.userAgent)
+      audit.objectRef                = del(.objectRef)
+      audit.responseStatus           = del(.responseStatus)
+      audit.requestReceivedTimestamp = del(.requestReceivedTimestamp)
+      audit.stageTimestamp           = del(.stageTimestamp)
+      audit.annotations              = del(.annotations)
+      .kubernetes = { "audit": audit }
+
+      # ── event.kind / event.action ──
+      # event.kind is always "event" per the Elastic ingest pipeline's unconditional set.
+      # event.action mirrors the kubernetes verb (watch/get/create/...).
+      .event.kind = "event"
+      if .kubernetes.audit.verb != null {
+        .event.action = .kubernetes.audit.verb
+      }
+
+      # ── normalize annotation keys (equivalent to the Elastic ingest pipeline's painless script) ──
+      # Elasticsearch rejects dotted keyword keys, so the Elastic ingest pipeline rewrites
+      # them with "." → "_". Mirror that. While iterating, also derive
+      # event.outcome from authorization.k8s.io/decision.
+      if is_object(.kubernetes.audit.annotations) {
+        normalized_annotations = {}
+        decision = ""
+        for_each(object!(.kubernetes.audit.annotations)) -> |annotation_key, annotation_val| {
+          safe_key = replace(annotation_key, ".", "_")
+          normalized_annotations = set!(normalized_annotations, [safe_key], annotation_val)
+          if annotation_key == "authorization.k8s.io/decision" {
+            decision = to_string(annotation_val) ?? ""
+          }
+        }
+        .kubernetes.audit.annotations = normalized_annotations
+        if decision == "allow" {
+          .event.outcome = "success"
+        } else if decision == "forbid" {
+          .event.outcome = "failure"
+        }
+      }
+
+      # ── event.outcome fallback ──
+      # Annotation-based outcome above takes precedence. When absent, derive
+      # from responseStatus.code: <400 success, >=400 failure, missing
+      # unknown. Panic events carry code=500 → "failure" if no annotation.
+      if .event.outcome == null {
+        status_code, status_err = to_int(.kubernetes.audit.responseStatus.code)
+        if status_err == null && status_code > 0 {
+          if status_code < 400 {
+            .event.outcome = "success"
+          } else {
+            .event.outcome = "failure"
+          }
+        } else {
+          .event.outcome = "unknown"
+        }
+      }
+
+      # ── user.name / user.id (with oidc-strip + lowercase) ──
+      # The Elastic ingest pipeline copies user.username verbatim; we additionally lowercase and
+      # strip a legacy "oidc:" prefix so downstream userdb lookups hit.
+      # Filebeat upstream renames the audit field user.username → user.name
+      # before delivery, so the username arrives under .user.name in the
+      # nested payload. Prefer canonical user.username when present, fall
+      # back to the Filebeat-renamed user.name.
+      username_raw = .kubernetes.audit.user.username
+      if username_raw == null {
+        username_raw = .kubernetes.audit.user.name
+      }
+      if username_raw != null {
+        username_lower = downcase(string!(username_raw))
+        if starts_with(username_lower, "oidc:") {
+          .user = { "name": slice!(username_lower, 5) }
+        } else {
+          .user = { "name": username_lower }
+        }
+        # ECS shape: only kubernetes.audit.user.name is preserved on the
+        # nested audit envelope. The "username" alias is redundant Filebeat
+        # legacy (the audit JSON shipped over the wire as "username" but the
+        # rename happens in the Filebeat decoder upstream) — keeping both
+        # leaks a Vector-only path the Elastic ingest pipeline does not emit.
+      }
+      if .kubernetes.audit.user.uid != null {
+        .user.id = .kubernetes.audit.user.uid
+      }
+
+      # ── user_agent.original ──
+      if .kubernetes.audit.userAgent != null {
+        .user_agent = { "original": .kubernetes.audit.userAgent }
+      }
+
+      # ── source.ip / client.ip / related.ip ──
+      # sourceIPs is an array. The reference Elastic ingest pipeline's `convert type: ip` produces a single
+      # source.ip from the first valid entry; client.ip mirrors it; every
+      # entry is appended to related.ip[]. We follow the same shape.
+      source_ips = array(.kubernetes.audit.sourceIPs) ?? []
+      if length(source_ips) > 0 {
+        first_source_ip = string!(source_ips[0])
+        .source = { "ip": first_source_ip }
+        .client = { "ip": first_source_ip }
+        .related = { "ip": source_ips }
+      }
+
+      # ── related.user (append + dedup) ──
+      # Append both the username and the uid so SIEM queries can pivot from
+      # either. The audit envelope only carries .user.name (post-Filebeat
+      # rename); we use that directly.
+      related_users = []
+      if .kubernetes.audit.user.name != null {
+        related_users = push(related_users, string!(.kubernetes.audit.user.name))
+      }
+      if .kubernetes.audit.user.uid != null {
+        related_users = push(related_users, string!(.kubernetes.audit.user.uid))
+      }
+      if length(related_users) > 0 {
+        .related.user = related_users
+      }
+
+      # ── orchestrator.* ──
+      # orchestrator.type is always "kubernetes". objectRef IS present on
+      # Panic events (the expected_fields manifest pins this), so we map
+      # resource/namespace/name when they are populated.
+      .orchestrator = { "type": "kubernetes" }
+      if .kubernetes.audit.apiVersion != null {
+        .orchestrator.api_version = .kubernetes.audit.apiVersion
+      }
+      if .kubernetes.audit.objectRef.resource != null {
+        .orchestrator.resource = { "type": .kubernetes.audit.objectRef.resource }
+      }
+      if .kubernetes.audit.objectRef.namespace != null {
+        .orchestrator.namespace = .kubernetes.audit.objectRef.namespace
+      }
+      if .kubernetes.audit.objectRef.name != null {
+        if .orchestrator.resource == null {
+          .orchestrator.resource = {}
+        }
+        .orchestrator.resource.name = .kubernetes.audit.objectRef.name
+      }
+
+      # ── @timestamp from requestReceivedTimestamp ──
+      # The Elastic ingest pipeline relies on the @timestamp Filebeat set; the cached
+      # the reference pipeline does not re-derive it. We re-derive from the audit
+      # field so the value is sourced from the audit event itself, not the
+      # Filebeat ingest moment. requestReceivedTimestamp is ISO 8601.
+      ts, ts_err = parse_timestamp(string!(.kubernetes.audit.requestReceivedTimestamp), format: "%+")
+      if ts_err == null {
+        ."@timestamp" = format_timestamp!(ts, format: "%+")
+      }
+
+      # ── cleanup empties ──
+      # Drop any null/empty paths that fell out of the conditional mappings
+      # so the output mirrors the Elastic ingest pipeline's final "drop null/empty" script.
+      . = compact(., null: true, string: true, object: true, array: true)
+
+  # ── 4b. remap_metadata_response_complete ─────────────────────────────────────
+  # Bulk partition — no requestObject/responseObject body (the highest-volume lane).
+  # Contains 2 impersonatedUser sub-shape events; user.name is the initiating user.
+  remap_metadata_response_complete:
+    type: remap
+    inputs:
+      - route_partitions.metadata_response_complete
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── annotations: labels → annotations rename fallback ──
+      # The reference Elastic ingest pipeline renames .labels → .annotations when annotations is absent so the
+      # rest of the pipeline only has to inspect one key. No-op when annotations
+      # is already present or both are absent.
+      if !exists(.annotations) && exists(.labels) {
+        .annotations = del(.labels)
+      }
+
+      # ── preserve event.original ──
+      # ECS requires event.original to reflect the wire payload. We snapshot
+      # the audit fields (excluding Filebeat envelope keys) as a JSON string
+      # before any mutation so a junior reader can recover the source event.
+      raw_audit = {
+        "kind":                      .kind,
+        "apiVersion":                .apiVersion,
+        "level":                     .level,
+        "stage":                     .stage,
+        "auditID":                   .auditID,
+        "verb":                      .verb,
+        "user":                      .user,
+        "impersonatedUser":          .impersonatedUser,
+        "sourceIPs":                 .sourceIPs,
+        "userAgent":                 .userAgent,
+        "objectRef":                 .objectRef,
+        "responseStatus":            .responseStatus,
+        "requestURI":                .requestURI,
+        "requestReceivedTimestamp":  .requestReceivedTimestamp,
+        "stageTimestamp":            .stageTimestamp,
+        "annotations":               .annotations,
+      }
+      raw_audit = compact(raw_audit, recursive: true)
+      event_original = encode_json(raw_audit)
+
+      # ── nest audit payload under kubernetes.audit.* (Elastic ingest pipeline shape) ──
+      # The reference Elastic ingest pipeline parses event.original into kubernetes.audit; we
+      # build that namespace directly from the already-typed fields so VRL
+      # can address them without re-parsing JSON.
+      audit = {}
+      audit.kind                     = .kind
+      audit.apiVersion               = .apiVersion
+      audit.level                    = .level
+      audit.stage                    = .stage
+      audit.auditID                  = .auditID
+      audit.verb                     = .verb
+      audit.user                     = .user
+      audit.impersonatedUser         = .impersonatedUser
+      audit.sourceIPs                = .sourceIPs
+      audit.userAgent                = .userAgent
+      audit.objectRef                = .objectRef
+      audit.responseStatus           = .responseStatus
+      audit.requestURI               = .requestURI
+      audit.requestReceivedTimestamp = .requestReceivedTimestamp
+      audit.stageTimestamp           = .stageTimestamp
+      audit.annotations              = .annotations
+      audit = compact(audit, recursive: true)
+
+      # ── annotation key normalization (equivalent to the reference Elastic ingest pipeline's painless script) ──
+      # Elasticsearch rejects dotted keyword keys; the Elastic ingest pipeline replaces "." with
+      # "_" in annotation keys so downstream indices accept them. Same rule
+      # here so our output is byte-comparable with the Elastic ingest pipeline's.
+      annotation_outcome = null
+      if is_object(audit.annotations) {
+        normalized_annotations = {}
+        for_each(object!(audit.annotations)) -> |key, val| {
+          safe_key = replace(key, ".", "_")
+          normalized_annotations = set!(normalized_annotations, [safe_key], val)
+        }
+        audit.annotations = normalized_annotations
+        decision_value = string(normalized_annotations."authorization_k8s_io/decision") ?? ""
+        if decision_value == "allow" {
+          annotation_outcome = "success"
+        } else if decision_value == "forbid" {
+          annotation_outcome = "failure"
+        }
+      }
+
+      # ── event.outcome derivation ──
+      # Annotation-based outcome (authorization.k8s.io/decision) wins when
+      # present; HTTP response code is the local fallback. "unknown" only when
+      # neither signal is available — never silently elided.
+      outcome = "unknown"
+      if annotation_outcome != null {
+        outcome = annotation_outcome
+      } else {
+        status_code = to_int(audit.responseStatus.code) ?? 0
+        if status_code > 0 && status_code < 400 {
+          outcome = "success"
+        } else if status_code >= 400 {
+          outcome = "failure"
+        }
+      }
+
+      # ── user.name: lowercase + strip oidc: prefix ──
+      # Filebeat renames the audit JSON's "username" field to "name", so the
+      # source key here is audit.user.name. The legacy OIDC authenticator
+      # prefixes usernames with "oidc:"; downstream userdb correlation
+      # expects a bare username so we strip it. user.name remains the
+      # initiating identity even when impersonatedUser is set.
+      raw_username = downcase(string(audit.user.name) ?? "")
+      user_name = if starts_with(raw_username, "oidc:") {
+        slice!(raw_username, 5)
+      } else {
+        raw_username
+      }
+
+      # ── related.user[]: accumulate username + uid ──
+      related_users = []
+      if user_name != "" {
+        related_users = push(related_users, user_name)
+      }
+      user_uid = string(audit.user.uid) ?? ""
+      if user_uid != "" {
+        related_users = push(related_users, user_uid)
+      }
+
+      # ── source.ip / client.ip / related.ip from sourceIPs[] ──
+      # The reference Elastic ingest pipeline uses the whole sourceIPs array via convert(type:ip); we mirror
+      # the first entry to source.ip + client.ip and keep the full array under
+      # related.ip[] for correlation searches.
+      source_ips = array(audit.sourceIPs) ?? []
+      first_source_ip = null
+      if length(source_ips) > 0 {
+        first_source_ip = string!(source_ips[0])
+      }
+
+      # ── orchestrator.* ──
+      # Constant orchestrator.type plus the objectRef-derived resource path.
+      # objectRef.namespace/name are optional (cluster-scoped resources omit
+      # namespace; subjectaccessreviews omit name), so we copy them
+      # unconditionally and let compact() drop the misses.
+      orchestrator = {}
+      orchestrator.type          = "kubernetes"
+      orchestrator.api_version   = audit.apiVersion
+      orchestrator.namespace     = audit.objectRef.namespace
+      orchestrator.resource      = {
+        "type": audit.objectRef.resource,
+        "name": audit.objectRef.name,
+      }
+
+      # ── build root output (build-out-then-assign, house-style G9) ──
+      # All ECS top-level namespaces are populated locally first to sidestep
+      # the E642 parent-path inference trap when many fields share parents.
+      out = {}
+      out."@timestamp"        = audit.requestReceivedTimestamp
+      out.event = {
+        "kind":     "event",
+        "category": ["configuration"],
+        "type":     ["info"],
+        "action":   audit.verb,
+        "outcome":  outcome,
+        "original": event_original,
+      }
+      out.orchestrator        = orchestrator
+      out.user = {
+        "name": user_name,
+        "id":   audit.user.uid,
+      }
+      out.user_agent          = { "original": audit.userAgent }
+      out.source              = { "ip": first_source_ip }
+      out.client              = { "ip": first_source_ip }
+      out.related = {
+        "user": related_users,
+        "ip":   source_ips,
+      }
+      out.kubernetes          = { "audit": audit }
+
+      # ── preserve Filebeat-supplied ECS envelope fields ──
+      # agent.* and host.* are legitimate ECS data describing the Filebeat
+      # collector pod; keep them. ecs.version traces the wire format.
+      out.agent               = .agent
+      out.host                = .host
+      out.ecs                 = ."ecs"
+      out.tags                = .tags
+
+      # ── strip non-ECS Filebeat host.* leaves ──
+      # host.containerized and host.os.codename are Beats-specific and have
+      # no ECS schema entry; remove them so gate 4 sees only ECS-valid paths.
+      del(out.host.containerized)
+      del(out.host.os.codename)
+
+      # ── final cleanup: drop null/empty recursively  ──
+      # Mirrors the Elastic ingest pipeline's final "drop empty values" script so the output
+      # field set matches the ECS gate.
+      . = compact(out, recursive: true, null: true, string: true, object: true, array: true)
+
+  # ── 4c. remap_request_response_complete ──────────────────────────────────────
+  # Carries requestObject (RBAC/workload payloads). High-SIEM-value partition.
+  remap_request_response_complete:
+    type: remap
+    inputs:
+      - route_partitions.request_response_complete
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── annotations: labels → annotations rename fallback ──
+      # The reference Elastic ingest pipeline renames .labels → .annotations when annotations is absent. The
+      # downstream `object(.annotations)` read then consumes a single key.
+      if !exists(.annotations) && exists(.labels) {
+        .annotations = del(.labels)
+      }
+
+      # ── preserve original payload before any mutation ──
+      # event.original is the JSON-encoded raw audit fields; required for any
+      # downstream re-parse and for forensic provenance.
+      original_json = encode_json(.)
+
+      # ── build the output object (build-out-then-assign pattern, house-style §G9) ──
+      out = {}
+
+      # ── ECS envelope fields (event.*) ──
+      out.event = {}
+      out.event.kind = "event"
+      out.event.original = original_json
+      verb = .verb
+      if verb != null {
+        out.event.action = verb
+      }
+
+      # ── timestamp from requestReceivedTimestamp (ISO8601) ──
+      ts_str, ts_err = string(.requestReceivedTimestamp)
+      if ts_err == null && ts_str != "" {
+        parsed_ts, terr = parse_timestamp(ts_str, format: "%+")
+        if terr == null {
+          out."@timestamp" = format_timestamp!(parsed_ts, format: "%+")
+        }
+      }
+      if !exists(out."@timestamp") {
+        # fall back to envelope @timestamp set by Filebeat
+        env_ts, env_err = string(."@timestamp")
+        if env_err == null && env_ts != "" {
+          out."@timestamp" = env_ts
+        }
+      }
+
+      # ── kubernetes.audit.* — preserve full audit payload under namespaced key ──
+      # Matches the Elastic ingest pipeline: the entire raw audit event is
+      # moved under kubernetes.audit and we then promote a handful of fields to
+      # top-level ECS paths.
+      kube_audit = .
+      # remove the Filebeat envelope keys that are not part of the audit schema —
+      # ecs.*, agent.*, host.*, @timestamp belong at root, not under audit.
+      env_keys = ["agent", "host", "ecs", "@timestamp"]
+      for_each(env_keys) -> |_idx, k| {
+        kube_audit = remove!(kube_audit, [k])
+      }
+      out.kubernetes = {}
+      out.kubernetes.audit = kube_audit
+
+      # ── normalize requestObject/responseObject for OpenSearch ingestion ──
+      # Conflict sources eliminated in-line so the full audit payload survives
+      # (containers[*].securityContext.* etc.):
+      # (a) Dotted keys (app.kubernetes.io/...) collide with nested-path
+      # mappings. Rewrite "." → "_" recursively, mirroring the annotation
+      # normalizer applied to .annotations on the audit event itself.
+      # (b) Service.spec.ports[].targetPort is IntOrString — coerce to string
+      # so first-write-wins mapping stays consistent. Other IntOrString
+      # fields (rollingUpdate max{Surge,Unavailable}, NetworkPolicy port)
+      # are not present in current traffic; add when observed.
+      # .metadata is still stripped: managedFields/selfLink + dotted label keys
+      # carry no SIEM value (matches the reference Elastic ingest pipeline).
+      del(out.kubernetes.audit.requestObject.metadata)
+      del(out.kubernetes.audit.responseObject.metadata)
+
+      req = object(out.kubernetes.audit.requestObject) ?? {}
+      if length(req) > 0 {
+        out.kubernetes.audit.requestObject = map_keys(req, recursive: true) -> |k| {
+          replace(k, ".", "_")
+        }
+      }
+      resp = object(out.kubernetes.audit.responseObject) ?? {}
+      if length(resp) > 0 {
+        out.kubernetes.audit.responseObject = map_keys(resp, recursive: true) -> |k| {
+          replace(k, ".", "_")
+        }
+      }
+
+      req_ports = array(out.kubernetes.audit.requestObject.spec.ports) ?? []
+      if length(req_ports) > 0 {
+        fixed = []
+        for_each(req_ports) -> |_i, p| {
+          o = object(p) ?? {}
+          if exists(o.targetPort) { o.targetPort = to_string!(o.targetPort) }
+          fixed = push(fixed, o)
+        }
+        out.kubernetes.audit.requestObject.spec.ports = fixed
+      }
+      resp_ports = array(out.kubernetes.audit.responseObject.spec.ports) ?? []
+      if length(resp_ports) > 0 {
+        fixed = []
+        for_each(resp_ports) -> |_i, p| {
+          o = object(p) ?? {}
+          if exists(o.targetPort) { o.targetPort = to_string!(o.targetPort) }
+          fixed = push(fixed, o)
+        }
+        out.kubernetes.audit.responseObject.spec.ports = fixed
+      }
+
+      # ── annotation key normalization (dots -> underscores) + outcome derivation ──
+      # Elasticsearch rejects field names containing dots inside a "flattened"
+      # value; the reference Elastic ingest pipeline's painless script does the same rewrite. The
+      # authorization.k8s.io/decision annotation is also our primary outcome
+      # signal (allow -> success, forbid -> failure).
+      ann = object(.annotations) ?? {}
+      normalized_ann = {}
+      decision_value = null
+      for_each(ann) -> |key, value| {
+        safe_key = replace(key, ".", "_")
+        normalized_ann = set!(normalized_ann, [safe_key], value)
+        if key == "authorization.k8s.io/decision" {
+          decision_value = value
+        }
+      }
+      out.kubernetes.audit.annotations = normalized_ann
+
+      # ── event.outcome ──
+      # Priority: explicit allow/forbid decision > responseStatus.code threshold.
+      if decision_value == "allow" {
+        out.event.outcome = "success"
+      } else if decision_value == "forbid" || decision_value == "deny" {
+        out.event.outcome = "failure"
+      } else {
+        # fall back to HTTP response code (<400 success, >=400 failure)
+        code_val = .responseStatus.code
+        if is_integer(code_val) {
+          code_int = to_int!(code_val)
+          if code_int < 400 {
+            out.event.outcome = "success"
+          } else {
+            out.event.outcome = "failure"
+          }
+        } else {
+          out.event.outcome = "unknown"
+        }
+      }
+
+      # ── orchestrator.* ──
+      out.orchestrator = {}
+      out.orchestrator.type = "kubernetes"
+      api_v = .apiVersion
+      if api_v != null {
+        out.orchestrator.api_version = api_v
+      }
+      obj_ref = object(.objectRef) ?? {}
+      res_type = obj_ref.resource
+      if res_type != null {
+        out.orchestrator.resource = {}
+        out.orchestrator.resource.type = res_type
+      }
+      res_name = obj_ref.name
+      if res_name != null {
+        out.orchestrator.resource = object(out.orchestrator.resource) ?? {}
+        out.orchestrator.resource.name = res_name
+      }
+      ns_val = obj_ref.namespace
+      if ns_val != null {
+        out.orchestrator.namespace = ns_val
+      }
+
+      # ── user.* ──
+      # K8s audit payload carries the principal under .user.name (NOT .user.username
+      # as some Elastic docs imply — that's an Elasticsearch schema artefact). All
+      # Most events in this partition carry system:* identities (nodes / service
+      # accounts), so the userdb lookup will miss; the result flows through
+      # un-enriched, which is correct per enrichment-userdb.md "system identities".
+      raw_username = .user.name
+      if raw_username != null {
+        username_lower = downcase(string!(raw_username))
+        # strip "oidc:" prefix (additional normalisation)
+        if starts_with(username_lower, "oidc:") {
+          username_lower = slice!(username_lower, 5)
+        }
+        out.user = {}
+        out.user.name = username_lower
+      }
+      user_uid = .user.uid
+      if user_uid != null {
+        out.user = object(out.user) ?? {}
+        out.user.id = user_uid
+      }
+
+      # ── user_agent.original ──
+      ua = .userAgent
+      if ua != null {
+        out.user_agent = {}
+        out.user_agent.original = ua
+      }
+
+      # ── source.ip / client.ip / related.ip from sourceIPs[] ──
+      # First entry is the canonical source; mirror to client.ip per the reference pipeline.
+      # related.ip collects every entry for cross-event correlation.
+      source_ips_raw = array(.sourceIPs) ?? []
+      if length(source_ips_raw) > 0 {
+        first_ip = string!(source_ips_raw[0])
+        out.source = { "ip": first_ip }
+        out.client = { "ip": first_ip }
+        related_ips = []
+        for_each(source_ips_raw) -> |_idx, ip_val| {
+          related_ips = push(related_ips, string!(ip_val))
+        }
+        out.related = { "ip": related_ips }
+      }
+
+      # ── related.user ──
+      related_users = []
+      if raw_username != null {
+        related_users = push(related_users, string!(raw_username))
+      }
+      if user_uid != null {
+        related_users = push(related_users, string!(user_uid))
+      }
+      if length(related_users) > 0 {
+        out.related = object(out.related) ?? {}
+        out.related.user = related_users
+      }
+
+      # ── ecs version (carry through from Filebeat envelope if present) ──
+      ecs_v = .ecs.version
+      if ecs_v != null {
+        out.ecs = { "version": ecs_v }
+      }
+
+      # ── preserve Filebeat-supplied ECS envelope fields ──
+      # agent.* and host.* are legitimate ECS data describing the Filebeat
+      # collector pod; keep them at root so analysts can pivot on the
+      # collector identity. Strip the two non-ECS Beats-specific leaves
+      # (host.containerized, host.os.codename) so gate 4 sees only
+      # ECS-valid paths — envelope_remap already strips them on the
+      # primary root, but the snapshot taken from `.` earlier may still
+      # carry them depending on partition ordering.
+      out.agent = .agent
+      out.host  = .host
+      del(out.host.containerized)
+      del(out.host.os.codename)
+
+      # ── commit ──
+      . = out
+
+  # ── 4d. remap_response_started ───────────────────────────────────────────────
+  # Streaming watch/list responses. Low SIEM signal; mapped minimally.
+  remap_response_started:
+    type: remap
+    inputs:
+      - route_partitions.response_started
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── annotations: labels → annotations rename fallback ──
+      # The reference Elastic ingest pipeline renames .labels → .annotations when annotations is absent so the
+      # snapshot below and the later object(.annotations) read see one key.
+      if !exists(.annotations) && exists(.labels) {
+        .annotations = del(.labels)
+      }
+
+      # ── preserve original audit payload ──
+      # Re-encode the audit fields (everything except Filebeat envelope residue)
+      # so the analyst can always recover the raw event when triaging downstream.
+      # We do this BEFORE moving the audit body so .event.original captures the
+      # source-of-truth shape.
+      audit_payload = {
+        "kind":                       .kind,
+        "apiVersion":                 .apiVersion,
+        "level":                      .level,
+        "auditID":                    .auditID,
+        "stage":                      .stage,
+        "requestURI":                 .requestURI,
+        "verb":                       .verb,
+        "user":                       .user,
+        "sourceIPs":                  .sourceIPs,
+        "userAgent":                  .userAgent,
+        "objectRef":                  .objectRef,
+        "responseStatus":             .responseStatus,
+        "requestReceivedTimestamp":   .requestReceivedTimestamp,
+        "stageTimestamp":             .stageTimestamp,
+        "annotations":                .annotations,
+      }
+      event_original = encode_json(audit_payload)
+
+      # ── move audit payload under kubernetes.audit.* (matches the reference Elastic ingest pipeline) ──
+      # Build the ECS document as a local object then assign to root once — avoids
+      # E642 parent-path mutation issues when many nested paths are populated.
+      out = {}
+
+      out.agent       = .agent
+      out.host        = .host
+      out.ecs         = .ecs
+
+      out.event = {
+        "kind":     "event",
+        "action":   .verb,
+        "original": event_original,
+      }
+      # event.outcome is derived from the authorization.k8s.io/decision
+      # annotation below . The decision is
+      # set before the response is started, so it's present and meaningful on
+      # ResponseStarted events too — we just need to wait until the annotation
+      # normalization loop has run before assigning.
+
+      out.orchestrator = {
+        "type":         "kubernetes",
+        "api_version":  .apiVersion,
+      }
+      if .objectRef.resource != null {
+        out.orchestrator.resource = { "type": .objectRef.resource }
+      }
+      if .objectRef.name != null {
+        out.orchestrator.resource = object!(out.orchestrator.resource || {})
+        out.orchestrator.resource.name = .objectRef.name
+      }
+      if .objectRef.namespace != null {
+        out.orchestrator.namespace = .objectRef.namespace
+      }
+
+      # ── user mapping ──
+      # k8s audit user.username carries either a service-account string
+      # ("system:serviceaccount:<ns>:<sa>"), a node identity, an apiserver
+      # identity, or a human (sometimes prefixed "oidc:..."). Lowercase and
+      # strip the oidc: prefix per local policy; the userdb lookup below will
+      # only hit for the human ones.
+      raw_username = string(.user.name) ?? ""
+      scrubbed_username = downcase(replace(raw_username, "oidc:", ""))
+      if scrubbed_username != "" {
+        out.user = { "name": scrubbed_username }
+      }
+      if .user.uid != null {
+        out.user = object!(out.user || {})
+        out.user.id = .user.uid
+      }
+
+      # ── user_agent ──
+      if .userAgent != null {
+        out.user_agent = { "original": .userAgent }
+      }
+
+      # ── source / client IP ──
+      # ECS source.ip / client.ip are scalar (normalize: None). Mirror the
+      # first sourceIPs[] entry; the full array goes to related.ip below
+      # (which IS normalize: array per ECS).
+      source_ips = array(.sourceIPs) ?? []
+      first_source_ip = null
+      if length(source_ips) > 0 {
+        first_source_ip = string!(source_ips[0])
+        out.source = { "ip": first_source_ip }
+        out.client = { "ip": first_source_ip }
+      }
+
+      # ── related.* (for ECS correlation queries) ──
+      related_users = []
+      if raw_username != "" {
+        related_users = push(related_users, raw_username)
+      }
+      uid_value = string(.user.uid) ?? ""
+      if uid_value != "" {
+        related_users = push(related_users, uid_value)
+      }
+      if length(related_users) > 0 {
+        out.related = { "user": related_users }
+      }
+      if length(source_ips) > 0 {
+        out.related = object!(out.related || {})
+        out.related.ip = source_ips
+      }
+
+      # ── normalize annotation keys (mirror the reference Elastic ingest pipeline's painless script) ──
+      # Elasticsearch refuses field names containing dots in mapped types, so
+      # the Elastic ingest pipeline rewrites every annotation key replacing '.' with '_' before
+      # storing under kubernetes.audit.annotations. Apply the same rewrite so
+      # SIEM dashboards expecting the underscore-form keys keep working.
+      annotations_in = object(.annotations) ?? {}
+      annotations_out = {}
+      decision = ""
+      for_each(annotations_in) -> |key, value| {
+        normalized_key = replace(key, ".", "_")
+        annotations_out = set!(annotations_out, [normalized_key], value)
+        if key == "authorization.k8s.io/decision" {
+          decision = to_string(value) ?? ""
+        }
+      }
+
+      # ── event.outcome from authorization.k8s.io/decision  ──
+      # The decision annotation is set before the response is started, so it's
+      # present and meaningful on ResponseStarted events too — derive accordingly.
+      if decision == "allow" {
+        out.event.outcome = "success"
+      } else if decision == "forbid" {
+        out.event.outcome = "failure"
+      } else {
+        out.event.outcome = "unknown"
+      }
+
+      # ── kubernetes.audit.* (vendor namespace — full audit context for SIEM) ──
+      # apiVersion + kind mirror the Elastic ingest pipeline's promotion of the audit envelope
+      # identifiers, so downstream consumers can confirm the schema version.
+      # sourceIPs is preserved as the full original array ;
+      # source.ip / client.ip are scalars derived from sourceIPs[0] at root.
+      kube_audit = {
+        "apiVersion":               .apiVersion,
+        "kind":                     .kind,
+        "auditID":                  .auditID,
+        "stage":                    "ResponseStarted",
+        "level":                    .level,
+        "verb":                     .verb,
+        "requestURI":               .requestURI,
+        "objectRef":                .objectRef,
+        "user":                     .user,
+        "userAgent":                .userAgent,
+        "sourceIPs":                .sourceIPs,
+        "annotations":              annotations_out,
+        "responseStatus":           .responseStatus,
+        "requestReceivedTimestamp": .requestReceivedTimestamp,
+        "stageTimestamp":           .stageTimestamp,
+      }
+      out.kubernetes = { "audit": kube_audit }
+
+      # ── @timestamp from requestReceivedTimestamp ──
+      ts_str = string!(.requestReceivedTimestamp)
+      out."@timestamp" = format_timestamp!(parse_timestamp!(ts_str, format: "%+"), format: "%+")
+
+      . = out
+
+  # ── 4e. remap_non_resource ───────────────────────────────────────────────────
+  # Examples: /readyz, /apis, API-group discovery. No objectRef — no
+  # orchestrator.resource.type / namespace. All Metadata+ResponseComplete.
+  # These are NOT authorized noise drops (probe detection is SIEM signal).
+  remap_non_resource:
+    type: remap
+    inputs:
+      - route_partitions.non_resource
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── annotations: labels → annotations rename fallback ──
+      # The reference Elastic ingest pipeline renames .labels → .annotations when annotations is absent. The
+      # snapshot + later .kubernetes.audit.annotations move then see one key.
+      if !exists(.annotations) && exists(.labels) {
+        .annotations = del(.labels)
+      }
+
+      # ── preserve original audit payload ──
+      # event.original holds the raw audit JSON (sans Filebeat envelope) so
+      # downstream consumers can replay the unmapped event. Build it before
+      # we mutate anything else.
+      audit_payload = {
+        "kind":                     .kind,
+        "apiVersion":               .apiVersion,
+        "level":                    .level,
+        "auditID":                  .auditID,
+        "stage":                    .stage,
+        "requestURI":               .requestURI,
+        "verb":                     .verb,
+        "user":                     .user,
+        "sourceIPs":                .sourceIPs,
+        "userAgent":                .userAgent,
+        "responseStatus":           .responseStatus,
+        "requestReceivedTimestamp": .requestReceivedTimestamp,
+        "stageTimestamp":           .stageTimestamp,
+        "annotations":              .annotations,
+      }
+      .event.original = encode_json(audit_payload)
+
+      # ── move audit fields under kubernetes.audit.* (matches the reference Elastic ingest pipeline) ──
+      .kubernetes.audit.kind                     = del(.kind)
+      .kubernetes.audit.apiVersion               = del(.apiVersion)
+      .kubernetes.audit.level                    = del(.level)
+      .kubernetes.audit.auditID                  = del(.auditID)
+      .kubernetes.audit.stage                    = del(.stage)
+      .kubernetes.audit.requestURI               = del(.requestURI)
+      .kubernetes.audit.verb                     = del(.verb)
+      .kubernetes.audit.user                     = del(.user)
+      .kubernetes.audit.userAgent                = del(.userAgent)
+      .kubernetes.audit.responseStatus           = del(.responseStatus)
+      .kubernetes.audit.requestReceivedTimestamp = del(.requestReceivedTimestamp)
+      .kubernetes.audit.stageTimestamp           = del(.stageTimestamp)
+      .kubernetes.audit.annotations              = del(.annotations)
+      audit_source_ips                           = del(.sourceIPs)
+      # Preserve the full sourceIPs[] array on the audit envelope
+      # parity). source.ip / client.ip below are scalars derived from
+      # audit_source_ips[0] and the related.ip[] correlation array mirrors
+      # the same data — kubernetes.audit.sourceIPs[] keeps the wire-shape.
+      .kubernetes.audit.sourceIPs = audit_source_ips
+
+      # ── ECS event categorization ──
+      # Probe-style requests to non-resource URLs — RBAC-allowed but still
+      # interesting for unauthorized-probe detection.
+      .event.kind     = "event"
+      .event.category = ["web"]
+      .event.type     = ["access"]
+      .event.action   = .kubernetes.audit.verb
+
+      # ── normalize annotation keys (equivalent to the reference Elastic ingest pipeline's painless script) ──
+      # Elasticsearch rejects dotted keyword keys, so the Elastic ingest pipeline replaces "." with
+      # "_" in annotation keys. Mirror that here. While iterating, also derive
+      # event.outcome from authorization.k8s.io/decision .
+      decision = ""
+      if is_object(.kubernetes.audit.annotations) {
+        normalized_annotations = {}
+        for_each(object!(.kubernetes.audit.annotations)) -> |annotation_key, annotation_val| {
+          safe_key = replace(annotation_key, ".", "_")
+          normalized_annotations = set!(normalized_annotations, [safe_key], annotation_val)
+          if annotation_key == "authorization.k8s.io/decision" {
+            decision = to_string(annotation_val) ?? ""
+          }
+        }
+        .kubernetes.audit.annotations = normalized_annotations
+      }
+
+      # ── event.outcome (ECS shape: annotation decision first, status fallback) ──
+      if decision == "allow" {
+        .event.outcome = "success"
+      } else if decision == "forbid" {
+        .event.outcome = "failure"
+      } else {
+        status_code, status_err = to_int(.kubernetes.audit.responseStatus.code)
+        if status_err == null && status_code > 0 {
+          if status_code < 400 {
+            .event.outcome = "success"
+          } else {
+            .event.outcome = "failure"
+          }
+        } else {
+          .event.outcome = "unknown"
+        }
+      }
+
+      # ── timestamp ──
+      # requestReceivedTimestamp is the canonical audit emission time. The
+      # the reference Elastic ingest pipeline's date processor uses ISO8601 — VRL's parser handles it natively.
+      .@timestamp = format_timestamp!(
+        parse_timestamp!(.kubernetes.audit.requestReceivedTimestamp, format: "%+"),
+        format: "%+"
+      )
+
+      # ── orchestrator fields ──
+      # The reference Elastic ingest pipeline sets orchestrator.type = "kubernetes" unconditionally and
+      # orchestrator.api_version from apiVersion. The objectRef-derived fields
+      # (orchestrator.resource.type / .namespace / .resource.name) are
+      # intentionally omitted: this partition has no objectRef.
+      .orchestrator.type        = "kubernetes"
+      .orchestrator.api_version = .kubernetes.audit.apiVersion
+
+      # ── user identity (with oidc: prefix scrub, lowercase) ──
+      # k8s emits OIDC-issued users as "oidc:<sub>"; strip the prefix so the
+      # value matches the AD-derived UPNs in the userdb table.
+      audit_username_raw = .kubernetes.audit.user.name
+      audit_username = ""
+      if audit_username_raw != null {
+        audit_username = downcase(string!(audit_username_raw))
+      }
+      if starts_with(audit_username, "oidc:") {
+        audit_username = slice!(audit_username, 5)
+      }
+      if audit_username != "" {
+        .user.name = audit_username
+      }
+      audit_uid = .kubernetes.audit.user.uid
+      if audit_uid != null {
+        .user.id = audit_uid
+      }
+      .user_agent.original = .kubernetes.audit.userAgent
+
+      # ── source / client IP (first sourceIPs[] entry) ──
+      # k8s audit reports the request origin as sourceIPs[]; first entry is
+      # the immediate caller. ECS source.ip / client.ip mirror that.
+      if is_array(audit_source_ips) && length!(audit_source_ips) > 0 {
+        first_source_ip = string!(audit_source_ips[0])
+        .source.ip = first_source_ip
+        .client.ip = first_source_ip
+      }
+
+      # ── related.* (correlation index) ──
+      # related.user gets both username and uid; related.ip gets every source IP.
+      related_users = []
+      if audit_username != "" {
+        related_users = push(related_users, audit_username)
+      }
+      if audit_uid != null {
+        related_users = push(related_users, string!(audit_uid))
+      }
+      if length(related_users) > 0 {
+        .related.user = related_users
+      }
+      if is_array(audit_source_ips) && length!(audit_source_ips) > 0 {
+        .related.ip = audit_source_ips
+      }
+
+  # ── 5. silent_drop_audit ─────────────────────────────────────────────────────
+  # Consumes .dropped output from ALL per-partition remaps PLUS the
+  # route_partitions._unmatched lane (unknown audit shapes).
+  # Per CLAUDE.md §8:
+  # - "noise:" prefixed aborts (only proxy_probe from envelope_remap) are
+  # silently discarded — they produce no output event.
+  # - Every other abort is resynthesised as an ECS-conformant pipeline_error
+  # event and forwarded to stdout_errors so it surfaces in kubectl logs.
+  # - _unmatched events are real audit lines with an unknown shape; they are
+  # not noise and must surface as pipeline_error.
+  silent_drop_audit:
+    type: remap
+    inputs:
+      - parse_audit_line.dropped
+      - envelope_remap.dropped
+      - remap_panic.dropped
+      - remap_metadata_response_complete.dropped
+      - remap_request_response_complete.dropped
+      - remap_response_started.dropped
+      - remap_non_resource.dropped
+      - route_partitions._unmatched
+    drop_on_abort: true
+    source: |
+      # ── classify: noise drop vs real error ──
+      # envelope_remap uses abort "noise:proxy_probe" for authorized drops.
+      # Vector populates .metadata.dropped.message with the verbatim string
+      # passed to `abort` (whereas .metadata.dropped.reason is the internal
+      # Vector enum like "abort" / "error" and never carries our "noise:" tag).
+      # Match Infoblox's silent_drop_audit which reads .message.
+      drop_reason = string(.metadata.dropped.message) ?? ""
+      if starts_with(drop_reason, "noise:") {
+        # Authorized noise drop — discard silently, produce no output event.
+        # drop_on_abort:true on this transform turns the abort into a clean drop.
+        abort
+      }
+
+      # ── synthesise ECS pipeline_error event ──
+      # Preserve the original event bytes so downstream analysts can inspect
+      # the payload that caused the abort. The error event itself is ECS-conformant
+      # per CLAUDE.md §8: event.kind = "pipeline_error", event.outcome = "failure".
+      # event.category/type align with Infoblox's silent_drop_audit shape.
+      original_event = encode_json(.)
+      . = {}
+      ."@timestamp"      = now()
+      .event = {
+        "kind":     "pipeline_error",
+        "category": ["host"],
+        "type":     ["info", "error"],
+        "outcome":  "failure",
+        "original": original_event,
+      }
+      .error = {
+        "type":    "vrl_abort",
+        "message": drop_reason,
+      }
+      .tags = ["_pipeline_error"]
+
+# ── sinks ──────────────────────────────────────────────────────────────────────
+
+sinks:
+  # ── normal output ──
+  # All successfully-parsed audit events land here as ECS-shaped JSON.
+  # Replace with your real destination (Kafka, Elasticsearch, OpenSearch, …)
+  # — see README.md "Customization".
+  stdout_out:
+    inputs:
+      - remap_panic
+      - remap_metadata_response_complete
+      - remap_request_response_complete
+      - remap_response_started
+      - remap_non_resource
+    type: console
+    target: stdout
+    encoding:
+      codec: json
+
+  # ── pipeline-error output ──
+  # silent_drop_audit converts every non-noise abort (and the
+  # route_partitions._unmatched lane) into ECS-conformant pipeline_error
+  # events. We send those to stderr so you can spot parser-coverage gaps
+  # without polluting the main output stream — split the destinations in
+  # production.
+  stderr_errors:
+    inputs:
+      - silent_drop_audit
+    type: console
+    target: stderr
+    encoding:
+      codec: json
