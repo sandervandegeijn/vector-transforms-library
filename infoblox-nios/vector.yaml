@@ -868,7 +868,7 @@ transforms:
         # the rich handshake form and the bare housekeeping form.
         dhcp_long, parse_err = parse_regex(
           dhcpd_message,
-          r'^(?:DHCP)?(?P<verb>ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on (?P<leased_ip>\S+) to (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?(?:\s+offered-duration\s+(?P<offered>\d+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s+uid\s+(?P<uid>\S+))?$'
+          r'^(?:DHCP)?(?P<verb>ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on (?P<leased_ip>\S+) to (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?(?:\s+offered-duration\s+(?P<offered>\d+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?$'
         )
         if parse_err == null {
           action_token = "dhcp-" + downcase(string!(dhcp_long.verb))
