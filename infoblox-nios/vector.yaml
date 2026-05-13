@@ -704,6 +704,16 @@ transforms:
         abort "noise:lease-state-active"
       }
 
+      # ── preflight: drop dhcpd bogus-hlen wire-protocol probes ──
+      # ISC dhcpd emits "Discarding packet with bogus hlen." when a packet
+      # arrives with a hardware-address-length field outside the allowed
+      # range. No client/IP/MAC context — it's a malformed wire-protocol
+      # probe, which CLAUDE.md §8 explicitly authorises as a noise-drop
+      # class. Authorized in docs/infoblox-authorized-drops.md.
+      if dhcpd_message == "Discarding packet with bogus hlen." {
+        abort "noise:dhcpd-bogus-hlen"
+      }
+
       # ── preflight: drop dhcpd self-stats noise ──
       # dhcpd emits two periodic operational-stats lines that have no SIEM
       # signal — already covered by Vector / k8s metrics and would otherwise
@@ -868,12 +878,17 @@ transforms:
         # the rich handshake form and the bare housekeeping form.
         dhcp_long, parse_err = parse_regex(
           dhcpd_message,
-          r'^(?:DHCP)?(?P<verb>ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on (?P<leased_ip>\S+) to (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?(?:\s+offered-duration\s+(?P<offered>\d+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?$'
+          r'^(?:DHCP)?(?P<verb>ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on (?P<leased_ip>\S+) to (?:""|(?P<mac>[0-9a-fA-F:]+))(?:\s+\((?P<hostname>[^)]*)\))?(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?(?:\s+offered-duration\s+(?P<offered>\d+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?$'
         )
         if parse_err == null {
+          # MAC slot accepts either a normal `:`-separated hex MAC or the
+          # literal empty quoted form `""` — Infoblox emits the latter when
+          # it can't resolve the client's chaddr (e.g. on a DHCPOFFER whose
+          # source packet had a malformed hardware address). The empty-MAC
+          # form leaves `mac` capture null so client_mac_raw stays null.
           action_token = "dhcp-" + downcase(string!(dhcp_long.verb))
           leased_ip = string!(dhcp_long.leased_ip)
-          client_mac_raw = string!(dhcp_long.mac)
+          if dhcp_long.mac != null { client_mac_raw = string!(dhcp_long.mac) }
           if dhcp_long.hostname != null { client_hostname = string!(dhcp_long.hostname) }
           if dhcp_long.iface != null { iface = string!(dhcp_long.iface) }
           # Infoblox sometimes emits the literal interface name in the
@@ -905,7 +920,7 @@ transforms:
         action_token = "dhcp-release"
         dhcprelease_of, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPRELEASE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+\((?P<found_state>(?:not\s+)?found)\))?(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?$'
+          r'^DHCPRELEASE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+\((?P<found_state>(?:not\s+)?found)\))?(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?$'
         )
         if parse_err == null {
           leased_ip = string!(dhcprelease_of.leased_ip)
@@ -946,7 +961,7 @@ transforms:
         action_token = "dhcp-request"
         dhcpreq, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPREQUEST for (?P<leased_ip>\S+)(?:\s+\((?P<server_id>\d+\.\d+\.\d+\.\d+)\))?\s+from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s*:\s*(?P<status_text>.+?))?$'
+          r'^DHCPREQUEST for (?P<leased_ip>\S+)(?:\s+\((?P<server_id>\d+\.\d+\.\d+\.\d+)\))?\s+from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?(?:\s+\((?P<state>[^)]*)\))?(?:\s*:\s*(?P<status_text>.+?))?$'
         )
         if parse_err == null {
           leased_ip = string!(dhcpreq.leased_ip)
@@ -999,7 +1014,7 @@ transforms:
         action_token = "dhcp-discover"
         dhcpdiscover, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPDISCOVER from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>[^\s:]+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s*:\s*(?P<status_text>.+?))?$'
+          r'^DHCPDISCOVER from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>[^\s:]+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?(?:\s*:\s*(?P<status_text>.+?))?$'
         )
         if parse_err == null {
           client_mac_raw = string!(dhcpdiscover.mac)
@@ -1032,7 +1047,7 @@ transforms:
         action_token = "dhcp-inform"
         dhcpinform, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPINFORM from (?P<src_ip>\S+)\s+via\s+(?P<via>[^\s:]+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s*:\s*(?P<status_text>.+?))?$'
+          r'^DHCPINFORM from (?P<src_ip>\S+)\s+via\s+(?P<via>[^\s:]+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?(?:\s*:\s*(?P<status_text>.+?))?$'
         )
         if parse_err == null {
           inform_source_ip = string!(dhcpinform.src_ip)
@@ -1332,7 +1347,7 @@ transforms:
         action_token = "dhcp-decline"
         decline, parse_err = parse_regex(
           dhcpd_message,
-          r'^DHCPDECLINE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid\s+(?P<uid>\S+))?(?:\s*:\s*(?P<status_text>.+?))?$'
+          r'^DHCPDECLINE of (?P<leased_ip>\S+) from (?P<mac>[0-9a-fA-F:]+)(?:\s+\((?P<hostname>[^)]*)\))?\s+via\s+(?P<via>\S+)(?:\s+TransID\s+(?P<transid>\S+))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?(?:\s*:\s*(?P<status_text>.+?))?$'
         )
         if parse_err == null {
           leased_ip = string!(decline.leased_ip)
