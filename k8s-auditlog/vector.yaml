@@ -254,11 +254,15 @@ transforms:
 
       # ── related.user (append + dedup) ──
       # Append both the username and the uid so SIEM queries can pivot from
-      # either. The audit envelope only carries .user.name (post-Filebeat
-      # rename); we use that directly.
+      # either. Production Filebeat ships the audit field as user.username
+      # verbatim; older versions renamed it to user.name. Accept either.
       related_users = []
-      if .kubernetes.audit.user.name != null {
-        related_users = push(related_users, string!(.kubernetes.audit.user.name))
+      audit_user_name = .kubernetes.audit.user.username
+      if audit_user_name == null {
+        audit_user_name = .kubernetes.audit.user.name
+      }
+      if audit_user_name != null {
+        related_users = push(related_users, string!(audit_user_name))
       }
       if .kubernetes.audit.user.uid != null {
         related_users = push(related_users, string!(.kubernetes.audit.user.uid))
@@ -406,12 +410,16 @@ transforms:
       }
 
       # ── user.name: lowercase + strip oidc: prefix ──
-      # Filebeat renames the audit JSON's "username" field to "name", so the
-      # source key here is audit.user.name. The legacy OIDC authenticator
-      # prefixes usernames with "oidc:"; downstream userdb correlation
-      # expects a bare username so we strip it. user.name remains the
-      # initiating identity even when impersonatedUser is set.
-      raw_username = downcase(string(audit.user.name) ?? "")
+      # Production Filebeat ships the audit JSON's "username" field verbatim;
+      # older versions renamed it to "name". Accept either. The legacy OIDC
+      # authenticator prefixes usernames with "oidc:"; downstream userdb
+      # correlation expects a bare username so we strip it. user.name remains
+      # the initiating identity even when impersonatedUser is set.
+      raw_username_src = audit.user.username
+      if raw_username_src == null {
+        raw_username_src = audit.user.name
+      }
+      raw_username = downcase(string(raw_username_src) ?? "")
       user_name = if starts_with(raw_username, "oidc:") {
         slice!(raw_username, 5)
       } else {
@@ -672,12 +680,15 @@ transforms:
       }
 
       # ── user.* ──
-      # K8s audit payload carries the principal under .user.name (NOT .user.username
-      # as some Elastic docs imply — that's an Elasticsearch schema artefact). All
+      # K8s audit's principal arrives as .user.username in current production
+      # Filebeat; older versions renamed it to .user.name. Accept either.
       # Most events in this partition carry system:* identities (nodes / service
       # accounts), so the userdb lookup will miss; the result flows through
       # un-enriched, which is correct per enrichment-userdb.md "system identities".
-      raw_username = .user.name
+      raw_username = .user.username
+      if raw_username == null {
+        raw_username = .user.name
+      }
       if raw_username != null {
         username_lower = downcase(string!(raw_username))
         # strip "oidc:" prefix (additional normalisation)
@@ -828,10 +839,15 @@ transforms:
       # ── user mapping ──
       # k8s audit user.username carries either a service-account string
       # ("system:serviceaccount:<ns>:<sa>"), a node identity, an apiserver
-      # identity, or a human (sometimes prefixed "oidc:..."). Lowercase and
-      # strip the oidc: prefix per local policy; the userdb lookup below will
-      # only hit for the human ones.
-      raw_username = string(.user.name) ?? ""
+      # identity, or a human (sometimes prefixed "oidc:..."). Production
+      # Filebeat preserves the raw "username" key; older versions renamed it
+      # to "name". Accept either. Lowercase and strip the oidc: prefix per
+      # local policy; the userdb lookup below will only hit for the human ones.
+      raw_username_src = .user.username
+      if raw_username_src == null {
+        raw_username_src = .user.name
+      }
+      raw_username = string(raw_username_src) ?? ""
       scrubbed_username = downcase(replace(raw_username, "oidc:", ""))
       if scrubbed_username != "" {
         out.user = { "name": scrubbed_username }
@@ -1054,8 +1070,13 @@ transforms:
 
       # ── user identity (with oidc: prefix scrub, lowercase) ──
       # k8s emits OIDC-issued users as "oidc:<sub>"; strip the prefix so the
-      # value matches the AD-derived UPNs in the userdb table.
-      audit_username_raw = .kubernetes.audit.user.name
+      # value matches the AD-derived UPNs in the userdb table. Production
+      # Filebeat ships the raw audit field user.username; older versions
+      # renamed it to user.name. Accept either.
+      audit_username_raw = .kubernetes.audit.user.username
+      if audit_username_raw == null {
+        audit_username_raw = .kubernetes.audit.user.name
+      }
       audit_username = ""
       if audit_username_raw != null {
         audit_username = downcase(string!(audit_username_raw))
