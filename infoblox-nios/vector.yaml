@@ -876,16 +876,16 @@ transforms:
         # with no via/relay/lease-duration tokens. Make the entire
         # `via <iface>` segment optional so the same regex covers both
         # the rich handshake form and the bare housekeeping form.
+        # MAC slot accepts either a normal `:`-separated hex MAC or the
+        # literal empty quoted form `""` — Infoblox emits the latter when
+        # it can't resolve the client's chaddr (e.g. on a DHCPOFFER whose
+        # source packet had a malformed hardware address). The empty-MAC
+        # form leaves `mac` capture null so client_mac_raw stays null.
         dhcp_long, parse_err = parse_regex(
           dhcpd_message,
           r'^(?:DHCP)?(?P<verb>ACK|OFFER|NAK|DECLINE|EXPIRE|RELEASE) on (?P<leased_ip>\S+) to (?:""|(?P<mac>[0-9a-fA-F:]+))(?:\s+\((?P<hostname>[^)]*)\))?(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?(?:\s+offered-duration\s+(?P<offered>\d+))?(?:\s+\((?P<state>[^)]*)\))?(?:\s+uid(?:\s+(?P<uid>\S+))?)?$'
         )
         if parse_err == null {
-          # MAC slot accepts either a normal `:`-separated hex MAC or the
-          # literal empty quoted form `""` — Infoblox emits the latter when
-          # it can't resolve the client's chaddr (e.g. on a DHCPOFFER whose
-          # source packet had a malformed hardware address). The empty-MAC
-          # form leaves `mac` capture null so client_mac_raw stays null.
           action_token = "dhcp-" + downcase(string!(dhcp_long.verb))
           leased_ip = string!(dhcp_long.leased_ip)
           if dhcp_long.mac != null { client_mac_raw = string!(dhcp_long.mac) }
@@ -1409,17 +1409,22 @@ transforms:
         # byte), and the bare hardware address. Treat as a lease-end
         # event so SOC can correlate with subsequent re-leases.
         action_token = "dhcp-free"
-        # uid=<uid> token is optional — ISC dhcpd also emits a uid-less
-        # variant (`<ip>: removing client association (free) hw=<mac>`)
-        # when the original lease had no option-61 client-id. The
-        # hw=<mac> token is always present.
+        # uid=<uid> token is optional — ISC dhcpd emits all three variants:
+        #   (a) `... (free) uid=<uid> hw=<mac>`  — option-61 client-id present
+        #   (b) `... (free) hw=<mac>`            — no uid token at all
+        #   (c) `... (free) uid= hw=<mac>`       — uid token with empty value
+        # `\S*` covers (a) and (c); the outer `?` covers (b). The hw=<mac>
+        # token is always present.
         free_assoc, parse_err = parse_regex(
           dhcpd_message,
-          r'^(?P<leased_ip>\d+\.\d+\.\d+\.\d+):\s+removing client association \(free\)(?:\s+uid=(?P<uid>\S+))?\s+hw=(?P<hw>[0-9a-fA-F:]+)$'
+          r'^(?P<leased_ip>\d+\.\d+\.\d+\.\d+):\s+removing client association \(free\)(?:\s+uid=(?P<uid>\S*))?\s+hw=(?P<hw>[0-9a-fA-F:]+)$'
         )
         if parse_err == null {
           leased_ip = string!(free_assoc.leased_ip)
-          if free_assoc.uid != null { client_uid = string!(free_assoc.uid) }
+          if free_assoc.uid != null {
+            uid_str = string!(free_assoc.uid)
+            if uid_str != "" { client_uid = uid_str }
+          }
           client_mac_raw = string!(free_assoc.hw)
         }
       } else if dhcpd_message == "Server starting service." ||
