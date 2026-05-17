@@ -1,0 +1,506 @@
+data_dir: /var/lib/vector
+
+# ── OpenSearch Security audit log — Vector → ECS example pipeline ──
+# Maps OpenSearch Security plugin audit events (audit_* prefix, format_version 4)
+# to the Elastic Common Schema.
+# Audit payloads are routed into two partitions by audit_request_layer:
+# • rest       → REST-layer authentication events (AUTHENTICATED, FAILED_LOGIN)
+# • transport  → TRANSPORT-layer index/privilege events (INDEX_EVENT,
+#                GRANTED_PRIVILEGES, MISSING_PRIVILEGES,
+#                OPENSEARCH_SECURITY_INDEX_ATTEMPT)
+# Anything that doesn't match a known layer stays in route_partitions._unmatched
+# and surfaces as a tagged pipeline_error via silent_drop_audit rather than
+# being silently dropped.
+# The example reads audit events from a newline-delimited JSON file.  To wire
+# the typical OpenSearch webhook shape instead, swap the `audit_log` source for
+# an `http_server` source — see README.md.
+# No userdb (AD) enrichment is wired in this example — the pipeline is a pure
+# parser / ECS normaliser.  README.md documents how to add user/department
+# lookup (a `memory` enrichment table) and GeoIP when you need them.
+#
+# GeoIP: OFF — audit_request_remote_address is typically an internal pod IP,
+# not the originating client address.  Enable enrichment only when you know
+# your remote addresses are routable.
+
+sources:
+  # ── OpenSearch Security audit log (file) ──
+  # OpenSearch writes one JSON object per line when the audit log is configured
+  # to use a log4j appender or a custom webhook that serialises to NDJSON.
+  # Adjust `include` to match the path on your host.
+  audit_log:
+    type: file
+    include:
+      - ./samples.ndjson
+    read_from: beginning
+
+transforms:
+  # ── parse raw log line into the root document ──
+  # The file source delivers each line as `.message`.  The audit log is
+  # NDJSON (one JSON object per line); parse it and replace `.` with the
+  # parsed object so the downstream route_partitions and remap_* logic
+  # (which assumes audit fields are at root, as the OpenSearch webhook would
+  # deliver them) sees the expected shape.
+  parse_audit_line:
+    type: remap
+    inputs:
+      - audit_log
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      raw = string!(.message)
+      parsed = parse_json!(raw)
+      . = object!(parsed)
+
+  # ── route events by audit_request_layer ──
+  # rest      → REST-layer auth events (AUTHENTICATED, FAILED_LOGIN)
+  # transport → TRANSPORT-layer events (INDEX_EVENT, GRANTED_PRIVILEGES,
+  #             MISSING_PRIVILEGES, OPENSEARCH_SECURITY_INDEX_ATTEMPT)
+  # _unmatched → events with no audit_request_layer (malformed / normalizer-error shape);
+  #              the synthetic _pipeline_error partition covers these — they route to
+  #              stdout_errors via silent_drop_audit below.
+  route_partitions:
+    type: route
+    inputs:
+      - parse_audit_line
+    route:
+      rest: '.audit_request_layer == "REST"'
+      transport: '.audit_request_layer == "TRANSPORT"'
+
+  # ── REST partition: AUTHENTICATED and FAILED_LOGIN ──
+  # Categories handled: AUTHENTICATED (outcome success), FAILED_LOGIN (outcome failure).
+  # FAILED_LOGIN events carry no audit_request_effective_user — identity unknown by design.
+  # Build pattern: build-out-then-assign-root (G9) — touches > 5 ECS fields.
+  remap_rest:
+    type: remap
+    inputs:
+      - route_partitions.rest
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── pull required fields ──
+      # string!() asserts presence and type. If any of these are absent the event is
+      # rerouted to silent_drop_audit and surfaces as a pipeline_error.
+      audit_category = string!(.audit_category)
+      audit_origin = string!(.audit_request_origin)
+      cluster_name = string!(.audit_cluster_name)
+      node_name = string!(.audit_node_name)
+      node_id = string!(.audit_node_id)
+      node_host_address = string!(.audit_node_host_address)
+      rest_method = string!(.audit_rest_request_method)
+      rest_path = string!(.audit_rest_request_path)
+      ts_raw = string!(."@timestamp")
+
+      # ── optional fields ──
+      # audit_request_effective_user is intentionally absent on FAILED_LOGIN events
+      # (identity unknown at the point of auth failure — OpenSearch Security plugin design).
+      # audit_request_effective_user_is_admin is absent on FAILED_LOGIN for the same reason.
+      effective_user = .audit_request_effective_user
+      rest_headers = .audit_rest_request_headers
+      is_admin = .audit_request_effective_user_is_admin
+
+      # audit_format_version is a JSON integer from parse_json — keep typed, do NOT coerce.
+      format_version = .audit_format_version
+
+      # ── event categorization ──
+      # Both REST categories are authentication events; outcome distinguishes them.
+      outcome = if audit_category == "AUTHENTICATED" { "success" } else { "failure" }
+
+      # ── timestamp ──
+      # OpenSearch emits ISO-8601 with millisecond precision and explicit UTC offset
+      # (e.g. "2026-05-13T16:29:10.448+00:00"); %+ handles it natively.
+      parsed_ts = parse_timestamp!(ts_raw, format: "%+")
+
+      # ── build the ECS output ──
+      out = {}
+      out."@timestamp" = format_timestamp!(parsed_ts, format: "%+")
+      out.event = {
+        "kind": "event",
+        "category": ["authentication"],
+        "type": ["start"],
+        "action": downcase(audit_category),
+        "module": "opensearch",
+        "dataset": "opensearch.audit",
+        "outcome": outcome
+      }
+      # observer.uid is not an ECS field — node identity is preserved under
+      # opensearch.audit.node.id (vendor namespace) below.
+      out.observer = {
+        "vendor": "OpenSearch",
+        "product": "Security Plugin",
+        "name": cluster_name,
+        "hostname": node_name,
+        "ip": [node_host_address]
+      }
+      out.http = {"request": {"method": rest_method}}
+      out.url = {"path": rest_path}
+
+      # ── source.ip from proxy headers (with remote_address fallback) ──
+      # Priority order, highest first:
+      #   1. X-Real-IP[0]              single-value header set by nginx ingress
+      #   2. X-Forwarded-For[0]        comma-separated chain; leftmost is original client
+      #   3. audit_request_remote_address   immediate TCP peer (usually the ingress pod IP)
+      # OpenSearch serialises every header as a JSON array (even single-valued ones), so we
+      # take [0]. The remote_address fallback guarantees source.ip is always populated when
+      # the OpenSearch node observed any peer at all. Garbage in any source aborts →
+      # silent_drop_audit synthesises a pipeline_error (never silently swallowed).
+      xri = .audit_rest_request_headers."X-Real-IP"[0]
+      xff_raw = .audit_rest_request_headers."X-Forwarded-For"[0]
+      remote_address_raw = .audit_request_remote_address
+      client_ip_raw = null
+      if xri != null {
+        client_ip_raw = string!(xri)
+      } else if xff_raw != null {
+        # XFF chain: take the leftmost hop (the original client) and trim whitespace.
+        xff_str = string!(xff_raw)
+        xff_first = split(xff_str, ",")[0]
+        client_ip_raw = strip_whitespace(string!(xff_first))
+      } else if remote_address_raw != null {
+        client_ip_raw = string!(remote_address_raw)
+      }
+      if client_ip_raw != null {
+        # VRL has no parse_ip; is_ipv4/is_ipv6 are the cheapest infallible checks.
+        client_ip = string!(client_ip_raw)
+        if !(is_ipv4(client_ip) || is_ipv6(client_ip)) {
+          abort "invalid client IP from proxy header or remote_address: " + client_ip
+        }
+        out.source = {"ip": client_ip}
+      }
+
+      # ── geoip enrichment (optional) ──
+      # When the upstream proxy populates X-Real-IP / X-Forwarded-For with a public address,
+      # enrich source.ip with MaxMind GeoLite2-City + ASN.  Declare two `geoip` enrichment
+      # tables at the top of the config (pointing at GeoLite2-City.mmdb / GeoLite2-ASN.mmdb)
+      # and uncomment the block below.  Gate on RFC1918 / loopback so org-internal traffic
+      # isn't geolocated against arbitrary MaxMind records.
+      #
+      #   if out.source.ip != null {
+      #     client_ip = string!(out.source.ip)
+      #     skip_geo = ip_cidr_contains!("10.0.0.0/8", client_ip) ||
+      #                ip_cidr_contains!("172.16.0.0/12", client_ip) ||
+      #                ip_cidr_contains!("192.168.0.0/16", client_ip) ||
+      #                ip_cidr_contains!("127.0.0.0/8", client_ip)
+      #     if !skip_geo {
+      #       src_geo, geo_err = get_enrichment_table_record("geoip_city", {"ip": client_ip})
+      #       if geo_err == null {
+      #         out.source.geo = {
+      #           "city_name":        src_geo.city_name,
+      #           "country_iso_code": src_geo.country_code,
+      #           "country_name":     src_geo.country_name,
+      #           "location":         {"lat": src_geo.latitude, "lon": src_geo.longitude}
+      #         }
+      #       }
+      #       asn_rec, asn_err = get_enrichment_table_record("geoip_asn", {"ip": client_ip})
+      #       if asn_err == null {
+      #         out.source.as = {
+      #           "number":       asn_rec.autonomous_system_number,
+      #           "organization": {"name": asn_rec.autonomous_system_organization}
+      #         }
+      #       }
+      #     }
+      #   }
+      #
+      # See README.md §Enrichment for the full enrichment_tables declaration.
+
+      # ── identity (only on AUTHENTICATED; absent on FAILED_LOGIN by design) ──
+      if effective_user != null {
+        user_name_lc = downcase(string!(effective_user))
+        out.user = {"name": user_name_lc}
+        # ── user.roles from effective_user_is_admin ──
+        # ECS user.roles is a keyword[]; surface the admin bit there so detection rules
+        # can match on identity properties directly. The raw boolean stays mirrored at
+        # opensearch.audit.request.effective_user_is_admin below for vendor fidelity.
+        # Skip when false/absent so we never emit an empty array.
+        if is_admin == true {
+          out.user.roles = ["admin"]
+        }
+      }
+
+      # ── vendor namespace: REST-specific audit fields ──
+      # Fields kept under opensearch.audit.* so SIEM can correlate without losing source detail.
+      audit_ns = {
+        "format_version": format_version,
+        "category": audit_category,
+        "request": {
+          "layer": string!(.audit_request_layer),
+          "origin": audit_origin,
+          "remote_address": string!(.audit_request_remote_address)
+        },
+        "node": {
+          "id": node_id,
+          "name": node_name,
+          "host_address": node_host_address
+        },
+        "rest": {
+          "request_headers": rest_headers
+        }
+      }
+      if is_admin != null { audit_ns.request.effective_user_is_admin = bool!(is_admin) }
+      out.opensearch = {"audit": audit_ns}
+
+      # Assign the assembled object to root; all unmapped audit_* fields are dropped.
+      . = out
+
+      # ── userdb enrichment (optional) ──
+      # The production pipeline enriches user.name with a canonical UPN and optionally
+      # adds user.department from an AD/IdP source.  Wire it in by declaring a `memory`
+      # enrichment table and adding a get_enrichment_table_record block here, e.g.:
+      #
+      #   if .user.name != null {
+      #     user_name_lc = string!(.user.name)
+      #     is_hash = match(user_name_lc, r'^[a-z0-9_-]{40,}$')
+      #     is_dn   = starts_with(user_name_lc, "cn=")
+      #     if !is_hash && !is_dn {
+      #       result, err = get_enrichment_table_record("user_mappings", { "key": "user:" + user_name_lc })
+      #       if err == null { .user.name = string!(result.value) }
+      #     }
+      #   }
+      #
+      # See README.md §Enrichment for the full enrichment_tables declaration.
+
+  # ── TRANSPORT partition: INDEX_EVENT, GRANTED_PRIVILEGES, MISSING_PRIVILEGES,
+  #    OPENSEARCH_SECURITY_INDEX_ATTEMPT ──
+  # All four categories share the same base field set; optional fields (remote_address,
+  # trace_doc_id, etc.) appear on a subset — each guarded with null-check below.
+  # Build pattern: build-out-then-assign-root (G9) — matches rest partition.
+  remap_transport:
+    type: remap
+    inputs:
+      - route_partitions.transport
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── pull required fields ──
+      audit_category = string!(.audit_category)
+      audit_layer = string!(.audit_request_layer)
+      audit_origin = string!(.audit_request_origin)
+      cluster_name = string!(.audit_cluster_name)
+      node_name = string!(.audit_node_name)
+      node_id = string!(.audit_node_id)
+      node_host_address = string!(.audit_node_host_address)
+      effective_user = string!(.audit_request_effective_user)
+      ts_raw = string!(."@timestamp")
+
+      # audit_format_version is a JSON integer from parse_json — keep typed, do NOT coerce.
+      format_version = .audit_format_version
+
+      # ── optional fields ──
+      # Bare field access returns null when absent; no ?? needed (would be E651).
+      remote_address = .audit_request_remote_address
+      task_id = .audit_trace_task_id
+      task_parent_id = .audit_trace_task_parent_id
+      privilege = .audit_request_privilege
+      transport_request_type = .audit_transport_request_type
+      transport_headers = .audit_transport_headers
+      trace_indices = .audit_trace_indices
+      trace_resolved_indices = .audit_trace_resolved_indices
+      trace_doc_id = .audit_trace_doc_id
+      effective_user_is_admin = .audit_request_effective_user_is_admin
+      request_body = .audit_request_body
+
+      # ── ECS event categorization (driven by audit_category) ──
+      # Mapping:
+      #   INDEX_EVENT                       → database / change / success
+      #   GRANTED_PRIVILEGES                → iam, network / allowed / success
+      #   MISSING_PRIVILEGES                → iam, network / denied / failure
+      #   OPENSEARCH_SECURITY_INDEX_ATTEMPT → iam, database / change / unknown
+      event_category = ["database"]
+      event_type = ["change"]
+      event_outcome = "success"
+      if audit_category == "GRANTED_PRIVILEGES" {
+        event_category = ["iam", "network"]
+        event_type = ["allowed"]
+        event_outcome = "success"
+      } else if audit_category == "MISSING_PRIVILEGES" {
+        event_category = ["iam", "network"]
+        event_type = ["denied"]
+        event_outcome = "failure"
+      } else if audit_category == "OPENSEARCH_SECURITY_INDEX_ATTEMPT" {
+        event_category = ["iam", "database"]
+        event_type = ["change"]
+        event_outcome = "unknown"
+      }
+
+      # ── timestamp ──
+      parsed_ts = parse_timestamp!(ts_raw, format: "%+")
+
+      # ── identity: lowercase at assignment ──
+      user_name_lc = downcase(effective_user)
+
+      # ── build the ECS output ──
+      out = {}
+      out."@timestamp" = format_timestamp!(parsed_ts, format: "%+")
+      out.event = {
+        "kind": "event",
+        "category": event_category,
+        "type": event_type,
+        "outcome": event_outcome,
+        "action": downcase(audit_category),
+        "module": "opensearch",
+        "dataset": "opensearch.audit"
+      }
+      # observer.uid is not an ECS field — node identity is preserved under
+      # opensearch.audit.node.id (vendor namespace) below.
+      out.observer = {
+        "vendor": "OpenSearch",
+        "product": "Security Plugin",
+        "name": cluster_name,
+        "hostname": node_name,
+        "ip": [node_host_address]
+      }
+      out.user = {"name": user_name_lc}
+      # ── user.roles from effective_user_is_admin ──
+      # ECS user.roles is a keyword[]; surface the admin bit there so detection rules
+      # can match on identity properties directly. The raw boolean stays mirrored at
+      # opensearch.audit.request.effective_user_is_admin below for vendor fidelity.
+      # Skip when false/absent so we never emit an empty array.
+      if effective_user_is_admin == true {
+        out.user.roles = ["admin"]
+      }
+
+      # ── source.ip from audit_request_remote_address ──
+      # TRANSPORT events have no proxy headers — the only client-IP signal is
+      # audit_request_remote_address (the calling node's TCP peer, typically another
+      # pod IP inside the cluster). Skip cleanly when absent. Garbage aborts →
+      # silent_drop_audit synthesises a pipeline_error (never silently swallowed).
+      # GeoIP would not apply here — TRANSPORT remote_address is always an
+      # RFC1918 pod IP, so any lookup would skip the geoip-gating CIDRs anyway.
+      client_ip_raw = .audit_request_remote_address
+      if client_ip_raw != null {
+        client_ip = string!(client_ip_raw)
+        if !(is_ipv4(client_ip) || is_ipv6(client_ip)) {
+          abort "invalid client IP from audit_request_remote_address: " + client_ip
+        }
+        out.source = {"ip": client_ip}
+      }
+
+      # ── vendor namespace (opensearch.audit.*) ──
+      # Mirrors raw fields for SIEM-side drill-down. Arrays (audit_trace_resolved_indices,
+      # audit_trace_indices) are kept as-is — never unrolled (can be 1000+ entries per event).
+      audit_ns = {
+        "format_version": format_version,
+        "category": audit_category,
+        "request": {
+          "layer": audit_layer,
+          "origin": audit_origin
+        },
+        "node": {
+          "id": node_id,
+          "name": node_name,
+          "host_address": node_host_address
+        }
+      }
+      if remote_address != null { audit_ns.request.remote_address = remote_address }
+      if privilege != null { audit_ns.request.privilege = privilege }
+      if effective_user_is_admin != null { audit_ns.request.effective_user_is_admin = effective_user_is_admin }
+      if request_body != null { audit_ns.request.body = request_body }
+      if transport_request_type != null {
+        audit_ns.transport = {"request_type": transport_request_type}
+      }
+      if transport_headers != null {
+        # Defensive: audit_ns.transport exists whenever transport_request_type was set,
+        # but a future event lacking request_type must still get its headers under
+        # opensearch.audit.transport.* rather than dropped.
+        if audit_ns.transport == null {
+          audit_ns.transport = {"headers": transport_headers}
+        } else {
+          audit_ns.transport.headers = transport_headers
+        }
+      }
+      trace_ns = {}
+      if task_id != null { trace_ns.task_id = task_id }
+      if task_parent_id != null { trace_ns.task_parent_id = task_parent_id }
+      if trace_indices != null { trace_ns.indices = trace_indices }
+      if trace_resolved_indices != null { trace_ns.resolved_indices = trace_resolved_indices }
+      if trace_doc_id != null { trace_ns.doc_id = trace_doc_id }
+      # trace_ns is a typed object literal — no bang needed on the if-guard (E620).
+      if length(trace_ns) > 0 { audit_ns.trace = trace_ns }
+      out.opensearch = {"audit": audit_ns}
+
+      # Assign the assembled object to root; unmapped audit_* fields are dropped by overwrite.
+      . = out
+
+      # ── userdb enrichment (optional) ──
+      # The production pipeline enriches user.name with a canonical UPN and optionally
+      # adds user.department from an AD/IdP source.  Skip opaque identities first:
+      # SHA-256 hashes (40+ alnum chars) or X.509 DNs (starts cn=).
+      #
+      #   is_hash = match(user_name_lc, r'^[a-z0-9_-]{40,}$')
+      #   is_dn   = starts_with(user_name_lc, "cn=")
+      #   if !is_hash && !is_dn {
+      #     result, err = get_enrichment_table_record("user_mappings", { "key": "user:" + user_name_lc })
+      #     if err == null { .user.name = string!(result.value) }
+      #   }
+      #
+      # See README.md §Enrichment for the full enrichment_tables declaration.
+
+  # ── silent_drop_audit: rescue every aborted event as an ECS pipeline_error ──
+  # Errors are never silent. Feeds from all remap .dropped outputs plus
+  # the _unmatched route (events with no audit_request_layer).
+  # Only noise:* abort messages would be discarded silently — none currently authorized
+  # for opensearch-auditlog; the guard exists to make the contract visible to the reader.
+  silent_drop_audit:
+    type: remap
+    inputs:
+      - parse_audit_line.dropped
+      - remap_rest.dropped
+      - remap_transport.dropped
+      - route_partitions._unmatched
+    drop_on_abort: true
+    source: |
+      # ── classify the abort ──
+      # Vector populates .metadata.dropped.message with the verbatim abort string.
+      # Unmatched-route events have no metadata.dropped — they arrive as-is from the router.
+      drop_reason = string(.metadata.dropped.message) ?? ""
+      component_id = string(.metadata.dropped.component_id) ?? "route_partitions"
+
+      # noise:* prefix → silently discard; abort so no event reaches stdout_errors.
+      if starts_with(drop_reason, "noise:") {
+        abort
+      }
+
+      # ── synthesize a pipeline_error event ──
+      original_event = encode_json(.)
+      . = {}
+      ."@timestamp" = now()
+      .event = {
+        "kind": "pipeline_error",
+        "category": ["process"],
+        "type": ["error"],
+        "outcome": "failure",
+        "module": "opensearch",
+        "dataset": "opensearch.audit",
+        "original": original_event
+      }
+      .error = {
+        "type": component_id,
+        "message": drop_reason
+      }
+      .observer = {
+        "vendor": "OpenSearch",
+        "product": "Security Plugin"
+      }
+      .tags = ["_pipeline_error"]
+
+sinks:
+  # ── ECS-mapped audit events (both partitions) → stdout ──
+  # Replace with your real destination (Kafka, Elasticsearch, OpenSearch, …)
+  # — see README.md §Customization.
+  stdout_out:
+    type: console
+    inputs:
+      - remap_rest
+      - remap_transport
+    target: stdout
+    encoding:
+      codec: json
+
+  # ── pipeline_error events (aborts + unmatched route) → stderr ──
+  # Surfaces parser-coverage gaps so you can detect and investigate failures
+  # without polluting the main output stream.
+  stderr_errors:
+    type: console
+    inputs:
+      - silent_drop_audit
+    target: stderr
+    encoding:
+      codec: json
