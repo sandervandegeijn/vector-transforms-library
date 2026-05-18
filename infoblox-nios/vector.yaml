@@ -831,8 +831,9 @@ transforms:
       # ── dhcpd warning preflight ──
       # ISC dhcpd / Infoblox emit a handful of internal warnings on the
       # same syslog channel as lease events ("label length exceeds 63 in
-      # fqdn option", "parse error ...", "bad ..."). They carry no client
-      # context, so they don't fit any DHCP<verb> shape. Classify them as
+      # fqdn option", "parse error ...", "bad ...", "error fetching
+      # dhcp_range: <cidr>/<cidr>///<n>/"). They carry no client context,
+      # so they don't fit any DHCP<verb> shape. Classify them as
       # host-info warnings up front so they don't fall into the
       # unrecognised fallback. Anything not matching a known prefix
       # continues to the main parse chain below.
@@ -840,7 +841,8 @@ transforms:
         starts_with(dhcpd_message, "label length") ||
         starts_with(dhcpd_message, "parse error") ||
         starts_with(dhcpd_message, "bad ") ||
-        starts_with(dhcpd_message, "fqdn ")
+        starts_with(dhcpd_message, "fqdn ") ||
+        starts_with(dhcpd_message, "error fetching ")
 
       if is_dhcpd_warning {
         action_token = "dhcpd-warning"
