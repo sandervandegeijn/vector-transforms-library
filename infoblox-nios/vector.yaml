@@ -1429,6 +1429,47 @@ transforms:
           }
           client_mac_raw = string!(free_assoc.hw)
         }
+      } else if starts_with(dhcpd_message, "BOOTREQUEST from ") {
+        # ── BOOTP request: legacy client requesting an address via relay ──
+        # ISC dhcpd handles BOOTP (RFC 951) on the same channel as DHCP.
+        # Format: "BOOTREQUEST from <mac> via <relay-or-iface>"
+        # No leased IP yet — the relay forwards the request to the server.
+        action_token = "bootp-request"
+        bootreq, parse_err = parse_regex(
+          dhcpd_message,
+          r'^BOOTREQUEST from (?P<mac>[0-9a-fA-F:]+)\s+via\s+(?P<via>\S+)$'
+        )
+        if parse_err == null {
+          client_mac_raw = string!(bootreq.mac)
+          via_token = string!(bootreq.via)
+          if match(via_token, r'^\d+\.\d+\.\d+\.\d+$') {
+            relay_ip = via_token
+          } else {
+            iface = via_token
+          }
+        }
+      } else if starts_with(dhcpd_message, "BOOTREPLY ") {
+        # ── BOOTP reply: server responding with an address assignment ──
+        # Format: "BOOTREPLY on <ip> to <mac> via <iface> [relay <relay>]
+        #          [lease-duration <secs>]"
+        # Same shape as the DHCP long-form verb but with BOOTREPLY prefix.
+        action_token = "bootp-reply"
+        bootreply, parse_err = parse_regex(
+          dhcpd_message,
+          r'^BOOTREPLY on (?P<leased_ip>\S+) to (?P<mac>[0-9a-fA-F:]+)(?:\s+via\s+(?P<iface>\S+))?(?:\s+relay\s+(?P<relay>\S+))?(?:\s+lease-duration\s+(?P<lease>\d+))?$'
+        )
+        if parse_err == null {
+          leased_ip = string!(bootreply.leased_ip)
+          client_mac_raw = string!(bootreply.mac)
+          if bootreply.iface != null { iface = string!(bootreply.iface) }
+          if bootreply.relay != null {
+            relay_token = string!(bootreply.relay)
+            if match(relay_token, r'^\d+\.\d+\.\d+\.\d+$') {
+              relay_ip = relay_token
+            }
+          }
+          if bootreply.lease != null { lease_duration_str = string!(bootreply.lease) }
+        }
       } else if dhcpd_message == "Server starting service." ||
                 dhcpd_message == "Exiting" ||
                 dhcpd_message == "Deferred DNS updates thread shutting down" ||
@@ -1726,6 +1767,14 @@ transforms:
           # Bound client requesting non-address config (DNS/NTP/...).
           .event.type = ["info", "connection"]
           .event.outcome = "unknown"
+        } else if action_token == "bootp-request" {
+          # BOOTP request — client opening via relay; no lease yet.
+          .event.type = ["info", "start"]
+          .event.outcome = "unknown"
+        } else if action_token == "bootp-reply" {
+          # BOOTP reply — server assigning address; lease in effect.
+          .event.type = ["info", "connection", "start"]
+          .event.outcome = "success"
         } else {
           # Option 82
           .event.type = ["info", "protocol"]
