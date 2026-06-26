@@ -1,0 +1,535 @@
+# ── SFTPGo (drakkan/sftpgo) — Vector → ECS example pipeline ──
+# Maps SFTPGo authentication events to the Elastic Common Schema (ECS 8.17).
+# SFTPGo emits structured JSON log events; this pipeline ingests them over an
+# HTTP endpoint and routes by the `sender` field into three auth partitions:
+#   • login             → successful FTP/SFTP/SSH authentication
+#   • connection_failed → pre-auth disconnect or credential failure
+#   • app_auth_failure  → DB-layer (dataprovider_postgresql/warn) or SSH daemon
+#                         (sftpd) auth failures carrying the detail in `message`
+# All other senders (uploads, downloads, file ops, …) are out-of-scope non-auth
+# events and are dropped at the route (reroute_unmatched: false).
+#
+# Error contract: genuine VRL failures are never silently dropped — they are
+# rerouted to a `silent_drop_audit` transform that emits ECS pipeline_error
+# events to stderr. Only authorised noise (abort "noise:…") is dropped silently.
+#
+# GeoIP enrichment (MaxMind GeoLite2 City + ASN) is enabled on source.ip. The
+# default paths below match the MaxMind install location; mount or download the
+# GeoLite2-City.mmdb / GeoLite2-ASN.mmdb databases there (see README.md). The
+# skip-CIDR gate covers only RFC1918 / loopback / link-local — add your own
+# internal public ranges if needed.
+
+data_dir: /var/lib/vector
+
+# ── enrichment tables: MaxMind GeoIP (city + ASN) ──
+enrichment_tables:
+  geoip_city:
+    type: geoip
+    path: /usr/share/GeoIP/GeoLite2-City.mmdb
+    locale: en
+  geoip_asn:
+    type: geoip
+    path: /usr/share/GeoIP/GeoLite2-ASN.mmdb
+
+sources:
+  # SFTPGo posts JSON log events to this HTTP endpoint (one JSON object per
+  # request body). Add an `auth:` block and TLS in front for production.
+  http:
+    type: http_server
+    address: "0.0.0.0:80"
+    decoding:
+      codec: json
+
+transforms:
+  # ── route_partitions: dispatch events to per-partition remaps ──
+  # Routing field: .sender (set by SFTPGo on every event).
+  # login          → successful auth (FTP/SFTP/SSH).
+  # connection_failed → pre-auth disconnect or credential failure.
+  # app_auth_failure → DB-layer (dataprovider_postgresql/warn) or SSH
+  #   daemon (sftpd) auth failures where message carries the auth detail.
+  # Unmatched senders (FTP, SFTP, Upload, Download, common, ftpserverlib,
+  #   Remove, Rename, Chmod, Truncate, …) are out-of-scope non-auth events —
+  #   authorised noise. reroute_unmatched: false drops them at the route so no
+  #   dead-end `_unmatched` output is created (avoids the "no consumers" WARN).
+  route_partitions:
+    type: route
+    reroute_unmatched: false
+    inputs:
+      - http
+    route:
+      login: '.sender == "login"'
+      connection_failed: '.sender == "connection_failed"'
+      app_auth_failure: '(.sender == "dataprovider_postgresql" && .level == "warn") || .sender == "sftpd"'
+
+  # ── remap_login: map successful authentication events to ECS ──
+  # sender=login covers FTP/SFTP/SSH logins; outcome is always success.
+  # Source IP is a bare IP in `.ip` (no port); protocol from `.protocol`.
+  # GeoIP gated on skip-CIDR list; private/internal IPs skip gracefully.
+  remap_login:
+    type: remap
+    inputs:
+      - route_partitions.login
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── build output object using build-out-then-assign-root pattern ──
+      # Avoids E642 type-inference errors on nested path assignments.
+      out = {}
+
+      # ── ECS metadata ──
+      out.ecs = { "version": "8.17.0" }
+      out."@timestamp" = string!(.timestamp)
+      out.event = {}
+      out.event.original = encode_json(.)
+      out.event.kind     = "event"
+      out.event.module   = "sftpgo"
+      out.event.action   = "login"
+      out.event.outcome  = "success"
+
+      # ── ECS event categorization ──
+      # Authentication success events belong to authentication + session.
+      out.event.category = ["authentication", "session"]
+      out.event.type     = ["start", "allowed"]
+
+      # ── service metadata ──
+      out.service = { "type": "sftpgo" }
+
+      # ── log level ──
+      out.log = {}
+      out.log.level = downcase(string!(.level))
+
+      # ── user mapping ──
+      out.user = {}
+      out.user.name = string!(.username)
+
+      # ── source network ──
+      out.source = {}
+      out.source.ip = string!(.ip)
+
+      # ── network mapping ──
+      # SFTPGo login events always use TCP; application protocol from `protocol` field.
+      out.network = {}
+      out.network.transport   = "tcp"
+      out.network.application = downcase(string!(.protocol))
+
+      # ── user agent ──
+      # Map client string; skip empty/"Unknown" — they add no signal.
+      raw_client = string(.client) ?? ""
+      if raw_client != "" && raw_client != "Unknown" {
+        out.user_agent = {}
+        out.user_agent.original = raw_client
+      }
+
+      # ── SFTPGo vendor namespace ──
+      out.sftpgo = {}
+      out.sftpgo.sender        = string!(.sender)
+      out.sftpgo.method        = string!(.method)
+      out.sftpgo.encrypted     = bool!(.encrypted)
+      out.sftpgo.connection_id = string!(.connection_id)
+
+      # ── related fields ──
+      out.related = {}
+      out.related.ip   = [out.source.ip]
+      out.related.user = [out.user.name]
+
+      # ── GeoIP enrichment — source IP ──
+      # Gate: skip RFC1918, loopback, and link-local ranges.
+      # Private/internal IPs return no record; the gate keeps output clean.
+      geo_skip_cidrs = [
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+        "172.16.0.0/12",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+      ]
+
+      source_ip_str = out.source.ip
+      source_geo_skip = false
+      for_each(geo_skip_cidrs) -> |_idx, cidr| {
+        if !source_geo_skip && ip_cidr_contains!(cidr, source_ip_str) {
+          source_geo_skip = true
+        }
+      }
+
+      if !source_geo_skip {
+        # ── city lookup ──
+        src_geo, src_geo_err = get_enrichment_table_record("geoip_city", { "ip": source_ip_str })
+        if src_geo_err == null {
+          out.source.geo = {}
+          out.source.geo.country_iso_code = src_geo.country_code
+          out.source.geo.country_name     = src_geo.country_name
+          # Only assign city_name / region_name when MaxMind has data —
+          # null values from the DB should be absent in ECS output, not present as null.
+          geo_city = string(src_geo.city_name) ?? ""
+          if geo_city != "" {
+            out.source.geo.city_name = geo_city
+          }
+          geo_region = string(src_geo.region_name) ?? ""
+          if geo_region != "" {
+            out.source.geo.region_name = geo_region
+          }
+          out.source.geo.location         = { "lat": src_geo.latitude, "lon": src_geo.longitude }
+        }
+
+        # ── ASN lookup ──
+        src_asn, src_asn_err = get_enrichment_table_record("geoip_asn", { "ip": source_ip_str })
+        if src_asn_err == null {
+          out.source.as = {}
+          out.source.as.number            = src_asn.autonomous_system_number
+          out.source.as.organization      = {}
+          out.source.as.organization.name = src_asn.autonomous_system_organization
+        }
+      }
+
+      # ── assign root ──
+      . = out
+
+  # ── silent_drop_audit: handle dropped events from all three remaps ──
+  # Noise aborts (prefix "noise:") are silently discarded.
+  # Genuine VRL failures become ECS pipeline_error events on stdout_errors.
+  # .metadata.dropped_event.message is statically typed non-null in Vector 0.56 — string!() is correct.
+  silent_drop_audit:
+    type: remap
+    inputs:
+      - remap_login.dropped
+      - remap_connection_failed.dropped
+      - remap_app_auth_failure.dropped
+    drop_on_abort: true
+    reroute_dropped: false
+    source: |
+      abort_msg = string!(.metadata.dropped_event.message)
+      if starts_with(abort_msg, "noise:") {
+        abort
+      }
+
+      err_event = {}
+      err_event.event = {}
+      err_event.event.kind     = "pipeline_error"
+      err_event.event.category = ["process"]
+      err_event.event.type     = ["error"]
+      err_event.event.outcome  = "failure"
+      err_event.error = {}
+      err_event.error.type     = "vrl_abort"
+      err_event.error.message  = abort_msg
+      err_event.event.original = abort_msg
+      . = err_event
+
+  # ── remap_connection_failed: map auth/connection failure events to ECS ──
+  # sender=connection_failed covers both pre-auth disconnects (login_type=no_auth_tried)
+  # and credential failures. Source IP is a bare IP in `.client_ip` (no port).
+  # event.outcome is "unknown" for no_auth_tried (no credentials presented),
+  # "failure" for actual credential failures.
+  remap_connection_failed:
+    type: remap
+    inputs:
+      - route_partitions.connection_failed
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── preserve original event before any mutation ──
+      raw_original = encode_json(.)
+
+      # ── build output object (build-out-then-assign-root pattern per G9) ──
+      # Avoids E642 on nested ECS paths; output shape is visible in one place.
+      out = {}
+
+      # ── @timestamp from Vector-injected UTC field ──
+      # http_server source always provides .timestamp (UTC nanosecond).
+      out."@timestamp" = string!(.timestamp)
+
+      # ── ECS event categorisation ──
+      # connection_failed covers both pre-auth disconnects (no_auth_tried) and
+      # actual credential failures (password / publickey). Both are authentication
+      # events in ECS.
+      out.event = {}
+      out.event.kind     = "event"
+      out.event.category = ["authentication"]
+      out.event.action   = "connection_failed"
+      out.event.module   = "sftpgo"
+
+      # event.type: start (attempt begins) + denied (never completed successfully)
+      out.event.type = ["start", "denied"]
+
+      # event.outcome: "failure" when a real credential was tried; "unknown" for
+      # no_auth_tried (connection dropped before any auth exchange).
+      login_type_val = string(.login_type) ?? ""
+      event_outcome = if login_type_val == "no_auth_tried" { "unknown" } else { "failure" }
+      out.event.outcome = event_outcome
+
+      out.event.original = raw_original
+
+      # ── log metadata ──
+      out.log = {}
+      out.log.level = downcase(string(.level) ?? "")
+
+      # ── source IP ──
+      # connection_failed uses `client_ip` (bare IP, no port) — distinct from
+      # `login` which uses `ip` and transfer logs which use `remote_addr` (host:port).
+      out.source = {}
+      out.source.ip = string(.client_ip) ?? ""
+
+      # ── user ──
+      # username may be empty string (connection dropped before auth exchange).
+      # Only populate user.name when a real username was presented.
+      raw_username = string(.username) ?? ""
+      if raw_username != "" {
+        out.user = {}
+        out.user.name = raw_username
+      }
+
+      # ── network ──
+      out.network = {}
+      out.network.transport   = "tcp"
+      out.network.application = downcase(string(.protocol) ?? "")
+
+      # ── error detail ──
+      out.error = {}
+      out.error.message = string(.error) ?? ""
+
+      # ── vendor namespace ──
+      # Fields with no direct ECS equivalent are preserved under sftpgo.*
+      out.sftpgo = {}
+      out.sftpgo.login_type = login_type_val
+      out.sftpgo.sender     = string(.sender) ?? ""
+
+      # ── ECS meta ──
+      out.ecs = {}
+      out.ecs.version = "8.17.0"
+
+      out.service = {}
+      out.service.type = "sftpgo"
+
+      # ── related fields ──
+      out.related = {}
+      out.related.ip = [out.source.ip]
+      if raw_username != "" {
+        out.related.user = [raw_username]
+      }
+
+      # ── GeoIP enrichment — source IP ──
+      # Gate: skip RFC1918, loopback, and link-local ranges.
+      # The connection_failed IPs are predominantly external (87.x, 109.x, 115.x, 45.x, 66.x).
+      geo_skip_cidrs = [
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+        "172.16.0.0/12",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+      ]
+
+      source_ip_str = out.source.ip
+      source_geo_skip = false
+      for_each(geo_skip_cidrs) -> |_idx, cidr| {
+        if !source_geo_skip && ip_cidr_contains!(cidr, source_ip_str) {
+          source_geo_skip = true
+        }
+      }
+
+      if !source_geo_skip {
+        # ── city lookup ──
+        src_geo, src_geo_err = get_enrichment_table_record("geoip_city", { "ip": source_ip_str })
+        if src_geo_err == null {
+          out.source.geo = {}
+          out.source.geo.country_iso_code = src_geo.country_code
+          out.source.geo.country_name     = src_geo.country_name
+          # Only assign city_name / region_name when MaxMind has data —
+          # null values from the DB should be absent in ECS output, not present as null.
+          geo_city = string(src_geo.city_name) ?? ""
+          if geo_city != "" {
+            out.source.geo.city_name = geo_city
+          }
+          geo_region = string(src_geo.region_name) ?? ""
+          if geo_region != "" {
+            out.source.geo.region_name = geo_region
+          }
+          out.source.geo.location         = { "lat": src_geo.latitude, "lon": src_geo.longitude }
+        }
+
+        # ── ASN lookup ──
+        src_asn, src_asn_err = get_enrichment_table_record("geoip_asn", { "ip": source_ip_str })
+        if src_asn_err == null {
+          out.source.as = {}
+          out.source.as.number            = src_asn.autonomous_system_number
+          out.source.as.organization      = {}
+          out.source.as.organization.name = src_asn.autonomous_system_organization
+        }
+      }
+
+      # ── assign root ──
+      . = out
+
+  # ── remap_app_auth_failure: map application-level auth failures to ECS ──
+  # Covers two sub-types:
+  #   A) sender=dataprovider_postgresql (level=warn): DB-layer auth errors;
+  #      username extracted from unstructured message via regex.
+  #   B) sender=sftpd: SSH daemon connection failures; source IP extracted
+  #      from message via regex. GeoIP applied when IP is extracted.
+  # Events that don't match the regex still flow — no username/IP extracted.
+  remap_app_auth_failure:
+    type: remap
+    inputs:
+      - route_partitions.app_auth_failure
+    drop_on_abort: true
+    reroute_dropped: true
+    source: |
+      # ── preserve original event fields before any mutation ──
+      raw_message = string(.message) ?? ""
+      raw_sender  = string(.sender)  ?? ""
+      raw_level   = string(.level)   ?? ""
+
+      # ── build output object ──
+      out = {}
+
+      # ── @timestamp from Vector-injected UTC field ──
+      # http_server source always provides .timestamp (UTC nanosecond).
+      out."@timestamp" = string!(.timestamp)
+
+      # ── ECS event classification ──
+      # Both sub-types are authentication failures: deny events at start-of-session.
+      out.event = {}
+      out.event.kind     = "event"
+      out.event.category = ["authentication"]
+      out.event.type     = ["start", "denied"]
+      out.event.outcome  = "failure"
+      # event.action = sender value — identifies which SFTPGo layer reported the failure
+      out.event.action   = downcase(raw_sender)
+      out.event.module   = "sftpgo"
+
+      # ── error message — the whole message is the error detail ──
+      out.error = {}
+      out.error.message = raw_message
+
+      # ── log level ──
+      out.log = {}
+      out.log.level = downcase(raw_level)
+
+      # ── ECS required fields ──
+      out.ecs = {}
+      out.ecs.version = "8.17.0"
+
+      # ── service type ──
+      out.service = {}
+      out.service.type = "sftpgo"
+
+      # ── vendor namespace ──
+      out.sftpgo = {}
+      out.sftpgo.sender = raw_sender
+
+      # ── sub-type A: dataprovider_postgresql — extract username from message ──
+      # Message format: error authenticating user "<username>": not found: ...
+      if raw_sender == "dataprovider_postgresql" {
+        pg_auth_match, pg_auth_err = parse_regex(
+          raw_message,
+          r'error authenticating user "(?P<username>[^"]+)"'
+        )
+        if pg_auth_err == null {
+          extracted_username = string(pg_auth_match.username) ?? ""
+          if extracted_username != "" {
+            out.user = {}
+            out.user.name = extracted_username
+            out.related = {}
+            out.related.user = [extracted_username]
+          }
+        }
+        # When regex doesn't match, event still flows — no username extracted
+      }
+
+      # ── sub-type B: sftpd — extract source IP from message ──
+      # Message format: failed to accept an incoming connection from ip "<ip>": [...]
+      if raw_sender == "sftpd" {
+        sftpd_ip_match, sftpd_ip_err = parse_regex(
+          raw_message,
+          r'from ip "(?P<ip>[^"]+)"'
+        )
+        if sftpd_ip_err == null {
+          extracted_ip = string(sftpd_ip_match.ip) ?? ""
+          if extracted_ip != "" {
+            out.source = {}
+            out.source.ip = extracted_ip
+
+            out.related = {}
+            out.related.ip = [extracted_ip]
+
+            # ── GeoIP enrichment on source.ip ──
+            # Gate: skip RFC1918, loopback, and link-local ranges.
+            geo_skip_cidrs = [
+              "10.0.0.0/8",
+              "192.168.0.0/16",
+              "172.16.0.0/12",
+              "127.0.0.0/8",
+              "169.254.0.0/16",
+              "fc00::/7",
+              "fe80::/10",
+            ]
+
+            source_geo_skip = false
+            for_each(geo_skip_cidrs) -> |_idx, cidr| {
+              if !source_geo_skip && ip_cidr_contains!(cidr, extracted_ip) {
+                source_geo_skip = true
+              }
+            }
+
+            if !source_geo_skip {
+              # ── city lookup ──
+              src_geo, src_geo_err = get_enrichment_table_record("geoip_city", { "ip": extracted_ip })
+              if src_geo_err == null {
+                out.source.geo = {}
+                out.source.geo.country_iso_code = src_geo.country_code
+                out.source.geo.country_name     = src_geo.country_name
+                # Only assign city_name / region_name when MaxMind has data —
+                # null values from the DB should be absent in ECS output, not present as null.
+                geo_city = string(src_geo.city_name) ?? ""
+                if geo_city != "" {
+                  out.source.geo.city_name = geo_city
+                }
+                geo_region = string(src_geo.region_name) ?? ""
+                if geo_region != "" {
+                  out.source.geo.region_name = geo_region
+                }
+                out.source.geo.location = { "lat": src_geo.latitude, "lon": src_geo.longitude }
+              }
+
+              # ── ASN lookup ──
+              src_asn, src_asn_err = get_enrichment_table_record("geoip_asn", { "ip": extracted_ip })
+              if src_asn_err == null {
+                out.source.as = {}
+                out.source.as.number = src_asn.autonomous_system_number
+                out.source.as.organization = {}
+                out.source.as.organization.name = src_asn.autonomous_system_organization
+              }
+            }
+          }
+        }
+        # When IP regex doesn't match, event still flows — no source.ip extracted
+      }
+
+      # ── assign root ──
+      . = out
+
+
+sinks:
+  # ── stdout_out: ECS-mapped auth events ──
+  # Replace this console sink with your real destination (Kafka, Elasticsearch,
+  # OpenSearch, …) for production; it consumes exactly the three remap outputs.
+  stdout_out:
+    type: console
+    inputs:
+      - remap_login
+      - remap_connection_failed
+      - remap_app_auth_failure
+    encoding:
+      codec: json
+    target: stdout
+
+  # ── stderr_errors: pipeline_error events for operator visibility ──
+  stderr_errors:
+    type: console
+    inputs:
+      - silent_drop_audit
+    encoding:
+      codec: json
+    target: stderr
