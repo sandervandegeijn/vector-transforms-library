@@ -50,7 +50,11 @@ analyst can extend coverage.
 - `DHCPREQUEST for <ip> [from <mac>] [via <relay-or-iface>] [TransID <hex>] [uid <uid>] [(<state>)]`
 - `DHCPDISCOVER from <mac> via <relay-or-iface> TransID <hex>`
 - `Option 82: received a <kind> DHCP packet from relay-agent <ip> with a circuit-id of "<cid>", a remote-id of "<rid>" for <ip> (<mac>) lease time …`
-- DDNS forward / reverse map adds, removes, and failure variants
+- DDNS forward / reverse map adds, removes, and failure variants —
+  including deferred queue-acks (`Addition/Removal of <forward|reverse> map
+  for <ip> deferred`, marked `ddns.deferred=true`, `event.outcome="unknown"`),
+  `Error adding forward map from <fqdn> to <ip>: <reason>`, and the
+  unresolved `by server <unknown address, family 0>` server form
 - Lease-pool free-list housekeeping (`<ip>: removing client association (free) [uid=<uid>] hw=<mac>` — uid token optional)
 - Truncated `DHCPEXPIRE on <ip> to` (relay-buffer cut; tagged `_truncated`)
 - A handful of dhcpd warnings (`label length …`, `parse error …`, `bad …`, `fqdn …`)
@@ -105,7 +109,8 @@ A summary — see the inline VRL comments for exact provenance.
 | `uid <hex>` | `infoblox_nios.dhcp.client_uid` |
 | `TransID <hex>` | `infoblox_nios.dhcp.transaction_id` |
 | Option 82 circuit-id / remote-id | `infoblox_nios.dhcp.option82.{circuit_id,remote_id}` |
-| DDNS fields | `infoblox_nios.dhcp.ddns.*` |
+| DDNS fields | `infoblox_nios.dhcp.ddns.*` (`direction`, `fqdn`, `target_ip`, `ptr_name`, `server`/`server_ip`/`server_port`, `reason`) |
+| DDNS deferred queue-ack | `infoblox_nios.dhcp.ddns.deferred=true`, `event.outcome="unknown"` (reuses the `ddns-add/remove-{forward,reverse}` action) |
 | (synthesized) | `event.action="dhcp-<verb>"`, `event.category=["network"]`, `event.type=["info","connection",…]`, `network.protocol="dhcp"`, `network.transport="udp"`, `network.iana_number="17"` |
 
 ## Authorized noise drops

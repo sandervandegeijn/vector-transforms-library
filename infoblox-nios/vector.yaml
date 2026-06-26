@@ -826,6 +826,7 @@ transforms:
       dhcp_status_text = null
       ddns_reason = null
       ddns_failure_server = null
+      ddns_deferred = null
       lifecycle_state = null
 
       # ── dhcpd warning preflight ──
@@ -1179,15 +1180,29 @@ transforms:
         if starts_with(dhcpd_message, "Removed forward map ") {
           action_token = "ddns-remove-forward"
           ddns_direction = "forward"
+          # The `by server <server>` slot is either the structured
+          # `<ip>#<port>` form or the literal `<unknown address, family 0>`
+          # token (no `#`). Capture verbatim, then sub-parse the structured
+          # form into server_ip/port and route the unresolved form into
+          # ddns_failure_server — mirrors the Added-forward branch above.
           ddns_remove_forward, parse_err = parse_regex(
             dhcpd_message,
-            r'^Removed forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server (?P<server_ip>\S+)#(?P<server_port>\d+)$'
+            r'^Removed forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+) by server\s+(?P<server>.+?)$'
           )
           if parse_err == null {
             ddns_fqdn = string!(ddns_remove_forward.fqdn)
             ddns_target_ip = string!(ddns_remove_forward.target_ip)
-            ddns_server_ip = string!(ddns_remove_forward.server_ip)
-            ddns_server_port = string!(ddns_remove_forward.server_port)
+            server_token = strip_whitespace(string!(ddns_remove_forward.server))
+            server_match, _smerr = parse_regex(
+              server_token,
+              r'^(?P<server_ip>\d+\.\d+\.\d+\.\d+)#(?P<server_port>\d+)$'
+            )
+            if _smerr == null {
+              ddns_server_ip = string!(server_match.server_ip)
+              ddns_server_port = string!(server_match.server_port)
+            } else {
+              ddns_failure_server = server_token
+            }
           }
         } else if starts_with(dhcpd_message, "Removed reverse map on ") {
           action_token = "ddns-remove-reverse"
@@ -1221,6 +1236,33 @@ transforms:
           }
         } else {
           parse_err = "unrecognised Removed-prefixed dhcpd message"
+        }
+      } else if match(dhcpd_message, r'^(?:Addition|Removal) of (?:forward|reverse) map for \S+ deferred$') {
+        # ── DDNS map operation deferred (queued) ──
+        # dhcpd's deferred-DDNS worker acks each lease's forward (A) / reverse
+        # (PTR) add or remove by queuing it and emitting "<Addition|Removal>
+        # of <forward|reverse> map for <ip> deferred". The <ip> is the leased
+        # client address directly — the reverse form here carries the plain
+        # IP, NOT an in-addr.arpa label, so no octet-reversal is needed; the
+        # leased_ip → client.ip fallback in the mapping block covers both
+        # directions. No fqdn, no server tuple: this is a pending
+        # acknowledgement, so outcome is unknown (not success). Reuse the
+        # ddns-* action tokens so SOC sees one action per logical op, with
+        # ddns.deferred=true distinguishing the queue ack from the later
+        # "Added …"/"Removed …" confirmation a few seconds afterwards.
+        deferred, parse_err = parse_regex(
+          dhcpd_message,
+          r'^(?P<verb>Addition|Removal) of (?P<direction>forward|reverse) map for (?P<leased_ip>\S+) deferred$'
+        )
+        if parse_err == null {
+          ddns_direction = string!(deferred.direction)
+          ddns_deferred = true
+          leased_ip = string!(deferred.leased_ip)
+          if string!(deferred.verb) == "Addition" {
+            action_token = "ddns-add-" + ddns_direction
+          } else {
+            action_token = "ddns-remove-" + ddns_direction
+          }
         }
       } else if starts_with(dhcpd_message, "Reverse map update for ") {
         # ── DDNS reverse-map update abandoned ──
@@ -1317,6 +1359,26 @@ transforms:
           } else {
             ddns_failure_server = server_token
           }
+        }
+      } else if starts_with(dhcpd_message, "Error adding forward map ") {
+        # ── DDNS forward-map add error ──
+        # LOG_ERR sibling of "Unable to add forward map …": dhcpd's A-record
+        # push to BIND errored out (typically "timed out" when the configured
+        # DNS server is unreachable). Same forward add-failure semantics,
+        # different verb and no server tuple. Format:
+        #   Error adding forward map from <fqdn> to <ip>: <reason>
+        # Reuse ddns-add-failed-forward so it shares outcome=failure and the
+        # reason pivot with the "Unable to add forward map …" shape.
+        action_token = "ddns-add-failed-forward"
+        ddns_direction = "forward"
+        err_fwd, parse_err = parse_regex(
+          dhcpd_message,
+          r'^Error adding forward map from (?P<fqdn>.+?) to (?P<target_ip>\S+):\s+(?P<reason>.+?)$'
+        )
+        if parse_err == null {
+          ddns_fqdn = string!(err_fwd.fqdn)
+          ddns_target_ip = string!(err_fwd.target_ip)
+          ddns_reason = strip_whitespace(string!(err_fwd.reason))
         }
       } else if starts_with(dhcpd_message, "Abandoning IP address ") {
         # ── lease abandonment ──
@@ -1583,6 +1645,12 @@ transforms:
         if ddns_failure_server != null {
           .infoblox_nios.dhcp.ddns.server = ddns_failure_server
         }
+        # ── deferred-update marker ──
+        # The "Addition/Removal of … map for <ip> deferred" shapes are queue
+        # acks, not confirmations. Flag them so SOC can distinguish the
+        # pending ack from the later "Added …"/"Removed …" event that shares
+        # the same event.action.
+        if ddns_deferred == true { .infoblox_nios.dhcp.ddns.deferred = true }
         # ── ddns-reverse-abandoned fallback for client.ip ──
         # The abandonment shape doesn't carry a PTR name; the leased IP
         # populated by the parse maps directly to client.ip when neither the
@@ -1590,6 +1658,7 @@ transforms:
         if .client.ip == null && leased_ip != null {
           .client.ip = string!(leased_ip)
         }
+        if .client.ip != null { .source.ip = .client.ip }
 
         # ── related.ip aggregation ──
         related_ips = []
@@ -1602,9 +1671,12 @@ transforms:
         .event.category = ["network"]
         .event.type     = ["info", "change"]
         .event.action   = action_token
-        # Add/Remove forward & reverse succeed; the abandonment and
-        # add-failure branches are failures — the reason is stashed above.
-        if action_token == "ddns-reverse-abandoned" ||
+        # Deferred queue acks are pending (unknown); the abandonment and
+        # add-failure branches are failures — the reason is stashed above;
+        # everything else (real Add/Remove forward & reverse) succeeded.
+        if ddns_deferred == true {
+          .event.outcome = "unknown"
+        } else if action_token == "ddns-reverse-abandoned" ||
            action_token == "ddns-add-failed-reverse" ||
            action_token == "ddns-add-failed-forward" {
           .event.outcome = "failure"
@@ -1622,6 +1694,7 @@ transforms:
         } else if inform_source_ip != null {
           .client.ip = inform_source_ip
         }
+        if .client.ip != null { .source.ip = .client.ip }
         if client_mac_raw != null {
           .client.mac = upcase(replace(string!(client_mac_raw), ":", "-"))
         }
@@ -1629,7 +1702,7 @@ transforms:
           # ECS host.hostname is the lowercased short hostname of the
           # *event source*. For a leased client it's the cleanest fit
           # ECS offers; the bracketed token is the client's name as
-          # known to the DHCP server (e.g. "L0164259", "LAPTOP-9BV9USIT").
+          # known to the DHCP server (e.g. "PC0001234", "LAPTOP-AB12CDE").
           .host.hostname = downcase(string!(client_hostname))
           .related.hosts = [downcase(string!(client_hostname))]
         }
